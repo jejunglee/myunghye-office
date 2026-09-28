@@ -48,7 +48,7 @@ VIEWS.meals = (v, args) => {
   const seg = [['today', '오늘'], ['week', '이번 주'], ['month', '이번 달']];
   v.innerHTML = `
     <div class="page-head"><div><div class="eyebrow">급식 식단표</div><h1>급식</h1></div>
-      <div class="actions">${mg ? `<button class="btn secondary" data-act="mealTemplate">${icon('table', 'width="16" height="16"')}양식</button><button class="btn secondary" data-act="mealImport">${icon('upload', 'width="16" height="16"')}식단표 엑셀 불러오기</button><button class="btn" data-act="editMeal" data-date="${ymd(base)}">${icon('edit', 'width="16" height="16"')}식단 입력</button>` : ''}</div></div>
+      <div class="actions">${mg ? `<button class="btn secondary" data-act="mealTemplate">${icon('table', 'width="16" height="16"')}양식</button><button class="btn secondary" data-act="mealImport">${icon('upload', 'width="16" height="16"')}식단표 불러오기 (한글·엑셀)</button><button class="btn" data-act="editMeal" data-date="${ymd(base)}">${icon('edit', 'width="16" height="16"')}식단 입력</button>` : ''}</div></div>
     <div class="cal-toolbar">
       <div class="segmented">${seg.map(([m, l]) => `<button class="${m === mode ? 'active' : ''}" data-act="go" data-to="#meals/${m}/${ts}">${l}</button>`).join('')}</div>
       <div class="cal-nav"><button class="icon-btn" data-act="go" data-to="#meals/${mode}/${ymd(prev)}">${icon('chevL')}</button><button class="icon-btn" data-act="go" data-to="#meals/${mode}/${ymd(next)}">${icon('chevR')}</button></div>
@@ -85,38 +85,166 @@ ACT.mealTemplate = async () => {
   ws['!cols'] = [{ wch: 8 }, { wch: 50 }, { wch: 8 }, { wch: 30 }, { wch: 20 }];
   const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, '식단표'); XLSX.writeFile(wb, '급식_식단표_양식.xlsx');
 };
+/* ---------- 식단표 해석: 엑셀·한글(HWP/HWPX) · 목록형/달력형 자동 인식 ---------- */
+const MEAL_SKIP = /^(조식|중식|석식|간식|점심|아침|저녁|메뉴|식단|급식|식단표|날짜|요일)$|원산지|알레르기|알러지|영양|단백질|탄수화물|지방|칼슘|철분|비타민|^[\d.,\s]+$|^[-–·*※~]+$/i;
+const DATE_HEAD = /^\s*(?:[(\[]?[월화수목금토일][)\]]?\s+)?(?:(20\d{2})\s*[.\-/년]\s*)?(?:(\d{1,2})\s*[.\-/월]\s*)?(\d{1,2})\s*일?\s*(?:[(\[]\s*[월화수목금토일]\s*(?:요일)?\s*[)\]])?\s*(?:[월화수목금토일]요일)?\s*$/;
+
+function normMealItem(s) {
+  s = s.replace(/[★☆◆◇●○■□▶※*#♥♡]/g, '').replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  let m = /^(.*?)\s*\(\s*((?:\d{1,2}\s*[.,]\s*)*\d{1,2})\s*\.?\s*\)\s*$/.exec(s);   // 된장국(5.6.13)
+  if (!m) m = /^(.*?[^\d\s.])\s*((?:\d{1,2}\.)+\d{0,2})\.?\s*$/.exec(s);             // 된장국 5.6.13.
+  if (m && m[1].trim()) {
+    const a = m[2].replace(/[\s,]/g, '.').split('.').filter((n) => n && +n >= 1 && +n <= 19);
+    return a.length ? `${m[1].trim()}(${a.join('.')})` : m[1].trim();
+  }
+  return s;
+}
+function splitMealLines(text) {
+  const out = { items: [], kcal: '' };
+  String(text || '').replace(/\r/g, '').replace(/<br\s*\/?>/gi, '\n').split(/\n|,(?![^(]*\))|·/).forEach((ln) => {
+    const t = ln.trim(); if (!t) return;
+    const k = /([\d.]+)\s*k?cal/i.exec(t); if (k) { out.kcal = String(Math.round(parseFloat(k[1]))); return; }
+    if (MEAL_SKIP.test(t)) return;
+    const it = normMealItem(t); if (it && it.length <= 25) out.items.push(it);
+  });
+  return out;
+}
+function detectYM(strs) {
+  for (const s of strs) { const m = /(20\d{2})\s*[년.\-/]\s*(\d{1,2})\s*월?/.exec(s || ''); if (m && +m[2] >= 1 && +m[2] <= 12) return { y: +m[1], m: +m[2] }; }
+  for (const s of strs) { const m = /(\d{1,2})\s*월/.exec(s || ''); if (m && +m[1] >= 1 && +m[1] <= 12) return { y: null, m: +m[1] }; }
+  return null;
+}
+function mkYmd(y, mo, d) { const dt = new Date(y, mo - 1, d); return dt.getMonth() === ((mo - 1 + 12) % 12) && dt.getDate() === d ? ymd(dt) : null; }
+
+/* 목록형: 머리글에 날짜 + 식단(메뉴) 열 */
+function parseMealList(grid, raw, ym) {
+  const h = grid.slice(0, 15).findIndex((r) => r.some((c) => /날짜|일자/.test(String(c))) && r.some((c) => /식단|메뉴|중식|음식/.test(String(c))));
+  if (h < 0) return null;
+  const head = grid[h].map((c) => String(c).replace(/\s/g, ''));
+  const col = (re) => head.findIndex((c) => re.test(c));
+  const C = { date: col(/날짜|일자/), menu: col(/식단|메뉴|중식|음식/), kcal: col(/칼로리|열량|kcal/i), origin: col(/원산지/), allergy: col(/알레르기|알러지/), note: col(/비고|공지/) };
+  const rows = [];
+  for (let i = h + 1; i < grid.length; i++) {
+    const r = grid[i]; const rr = (raw && raw[i]) || [];
+    let date = cellToDate(rr[C.date], r[C.date], ym.y);
+    if (!date) { const m = DATE_HEAD.exec(String(r[C.date] || '').split('\n')[0]); if (m) date = mkYmd(+m[1] || ym.y, +m[2] || ym.m, +m[3]); }
+    const parsed = splitMealLines(r[C.menu]);
+    if (!date || !parsed.items.length) continue;
+    rows.push({ date, items: parsed.items, kcal: (C.kcal >= 0 ? String(r[C.kcal]).replace(/[^\d.]/g, '') : '') || parsed.kcal, origin: C.origin >= 0 ? String(r[C.origin] || '') : '', allergyText: C.allergy >= 0 ? String(r[C.allergy] || '') : '', note: C.note >= 0 ? String(r[C.note] || '') : '' });
+  }
+  return rows.length ? rows : null;
+}
+/* 달력형: 칸의 첫 줄이 날짜, 아래 줄(또는 아래 칸)이 메뉴 */
+function parseMealCalendar(grid, ym) {
+  const found = [];
+  const head = (t) => DATE_HEAD.exec(String(t || '').replace(/\r/g, '').split('\n')[0]);
+  for (let r = 0; r < grid.length; r++) {
+    for (let c = 0; c < grid[r].length; c++) {
+      const m = head(grid[r][c]); if (!m) continue;
+      let menu = String(grid[r][c]).replace(/\r/g, '').split('\n').slice(1).join('\n');
+      if (!splitMealLines(menu).items.length) {
+        const parts = [];
+        for (let rr = r + 1; rr < Math.min(grid.length, r + 12); rr++) { const t = grid[rr][c]; if (head(t)) break; if (t) parts.push(t); }
+        menu = parts.join('\n');
+      }
+      const p = splitMealLines(menu);
+      if (p.items.length) found.push({ r, y: m[1] ? +m[1] : null, mo: m[2] ? +m[2] : null, d: +m[3], ...p });
+    }
+  }
+  if (!found.length) return null;
+  // 식단 달력인지 확인: 한 줄에 날짜 칸이 2개 이상이거나 요일 머리글(월~금)이 있는 표만 인정
+  const dateRows = {}; found.forEach((e) => { dateRows[e.r] = (dateRows[e.r] || 0) + 1; });
+  const weekdayHead = grid.some((row) => row.filter((c) => /^\s*[(\[]?[월화수목금][)\]]?(요일)?\s*$/.test(String(c))).length >= 3);
+  if (!weekdayHead && !Object.values(dateRows).some((n) => n >= 2)) return null;
+  // 달력 앞뒤의 지난달·다음달 날짜 보정 (월이 적히지 않은 날짜만)
+  const noMo = found.filter((e) => !e.mo);
+  let off = (noMo.length && noMo[0].d > 20 && noMo.some((e) => e.d <= 7)) ? -1 : 0; let prev = null;
+  return found.map((e) => {
+    if (!e.mo) { if (prev && e.d < prev.d - 15) off++; prev = e; }
+    const base = new Date(e.y || ym.y, (e.mo || ym.m) - 1 + (e.mo ? 0 : off), 1);
+    const date = mkYmd(base.getFullYear(), base.getMonth() + 1, e.d);
+    return date ? { date, items: e.items, kcal: e.kcal, origin: '', allergyText: '', note: '' } : null;
+  }).filter(Boolean);
+}
+async function readMealSource(file) {
+  const ext = extOf(file.name);
+  if (ext === 'hwp' || ext === 'hwpx') {
+    const d = ext === 'hwp' ? await parseHwpDoc(file) : await parseHwpxDoc(file);
+    return { grids: d.tables.map((g) => ({ grid: g, raw: null })), texts: [file.name, ...d.paras, ...d.tables.flat(2)] };
+  }
+  await loadLib('XLSX');
+  const wb = ext === 'csv' ? XLSX.read(await file.text(), { type: 'string', raw: true }) : XLSX.read(await file.arrayBuffer(), { type: 'array' });
+  const grids = wb.SheetNames.map((n) => ({
+    grid: XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: false, defval: '' }).map((r) => r.map((x) => String(x).replace(/\r/g, ''))),
+    raw: XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: '' }),
+  }));
+  return { grids, texts: [file.name, ...grids.flatMap((g) => g.grid.slice(0, 6).flat())] };
+}
+function parseMealSource(src, ym) {
+  for (const g of src.grids) { const r = parseMealList(g.grid, g.raw, ym); if (r) return { kind: '목록형', rows: r }; }
+  const all = new Map();
+  for (const g of src.grids) (parseMealCalendar(g.grid, ym) || []).forEach((x) => { const e = all.get(x.date); if (!e || x.items.length > e.items.length) all.set(x.date, x); });
+  if (all.size) return { kind: '달력형', rows: [...all.values()].sort((a, b) => a.date.localeCompare(b.date)) };
+  return null;
+}
+
 ACT.mealImport = () => {
   const m = openModal({
     title: '식단표 불러오기', wide: true,
-    body: `<label class="dropzone" id="mlDrop">${icon('upload')}<div><b>식단표 엑셀(XLSX·XLS·CSV)</b>을 선택하세요</div><div style="font-size:12px;color:var(--text-3);margin-top:4px">열: 날짜 | 식단(메뉴) | 칼로리 | 원산지 | 알레르기 | 비고 — 메뉴는 줄바꿈 또는 쉼표로 구분</div><input type="file" accept=".xlsx,.xls,.csv" hidden></label><div id="mlPrev"></div>`,
-    foot: `<button class="btn secondary" data-act="closeModal">취소</button><button class="btn" id="mlGo" disabled>날짜별 데이터로 변환</button>`,
+    body: `<label class="dropzone" id="mlDrop">${icon('upload')}<div><b>식단표 파일 (한글 HWP·HWPX / 엑셀 XLSX·XLS·CSV)</b>을 끌어오거나 클릭하여 선택</div>
+      <div style="font-size:12px;color:var(--text-3);margin-top:4px">달력형(칸마다 날짜+메뉴)·목록형(날짜 | 식단 열) 모두 자동 인식 · 알레르기 번호·kcal 자동 정리</div><input type="file" accept=".xlsx,.xls,.csv,.hwp,.hwpx" hidden></label>
+      <div id="mlPrev"></div>`,
+    foot: `<div class="left"><label class="check"><input type="checkbox" id="mlKeep" checked> 원본 파일을 자료실(급식)에 보존</label></div>
+      <button class="btn secondary" data-act="closeModal">취소</button><button class="btn" id="mlGo" disabled>날짜별 식단으로 반영</button>`,
   });
-  let rows = [];
-  $('input', m).addEventListener('change', async (e) => {
-    const file = e.target.files[0]; if (!file) return;
+  let src = null; let file = null; let res = null; let ym = null;
+  const T = today();
+  const render = () => {
+    res = parseMealSource(src, ym);
+    const box = $('#mlPrev', m);
+    if (!res) { box.innerHTML = `<div class="empty" style="color:var(--red);text-align:left;padding:16px 4px">식단을 찾지 못했습니다.<br><span style="font-size:13px;color:var(--text-2)">· 달력형: 칸의 첫 줄에 날짜(예: 1, 1(월), 10.1), 그 아래에 메뉴<br>· 목록형: 첫 줄에 「날짜」「식단」 제목이 있는 표<br>양식이 다르면 「양식」 버튼의 엑셀 양식을 사용해 주세요.</span></div>`; $('#mlGo', m).disabled = true; return; }
+    const years = [T.getFullYear() - 1, T.getFullYear(), T.getFullYear() + 1];
+    box.innerHTML = `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:14px 0 10px">
+        <span class="tag blue">${res.kind}</span><b>${res.rows.length}일치 식단 인식</b>
+        ${res.kind === '달력형' ? `<span style="margin-left:auto;font-size:13px;color:var(--text-2)">식단 연·월</span>
+          <select class="input" id="mlY" style="width:auto;padding:6px 10px">${years.map((y) => `<option ${y === ym.y ? 'selected' : ''}>${y}</option>`).join('')}</select>
+          <select class="input" id="mlM" style="width:auto;padding:6px 10px">${Array.from({ length: 12 }, (_, i) => `<option value="${i + 1}" ${i + 1 === ym.m ? 'selected' : ''}>${i + 1}월</option>`).join('')}</select>` : ''}
+      </div>
+      <div class="table-wrap" style="max-height:46vh;overflow:auto"><table class="tbl"><thead><tr><th></th><th>날짜</th><th>식단</th><th>kcal</th><th>상태</th></tr></thead><tbody>
+      ${res.rows.map((r, i) => `<tr><td><input type="checkbox" data-i="${i}" checked></td><td class="num">${fmtMD(r.date)}</td><td>${r.items.map((x) => { const it = mealItem(x); return esc(it.n) + (it.a ? `<sup style="color:var(--text-3)">${esc(it.a)}</sup>` : ''); }).join(', ')}</td><td>${esc(r.kcal)}</td>
+        <td>${DB.meals[r.date] ? '<span class="tag orange">덮어씀</span>' : '<span class="tag green">새로</span>'}</td></tr>`).join('')}</tbody></table></div>`;
+    $$('input[data-i]', box).forEach((c) => c.addEventListener('change', () => { res.rows[c.dataset.i].off = !c.checked; }));
+    const yS = $('#mlY', box); const mS = $('#mlM', box);
+    if (yS) [yS, mS].forEach((s) => s.addEventListener('change', () => { ym = { y: +yS.value, m: +mS.value }; render(); }));
+    $('#mlGo', m).disabled = !res.rows.length;
+  };
+  const handle = async (f) => {
+    if (!f) return;
+    file = f; $('#mlPrev', m).innerHTML = '<div class="empty">파일을 읽는 중…</div>';
     try {
-      const { raw, txt } = await readSheetRows(file);
-      let h = txt.findIndex((r) => r.some((c) => /날짜|일자/.test(String(c))));
-      if (h < 0) throw new Error('「날짜」 열을 찾지 못했습니다.');
-      const head = txt[h].map((c) => String(c).replace(/\s/g, ''));
-      const col = (re) => head.findIndex((c) => re.test(c));
-      const C = { date: col(/날짜|일자/), menu: col(/식단|메뉴|중식|음식/), kcal: col(/칼로리|열량|kcal/i), origin: col(/원산지/), allergy: col(/알레르기|알러지/), note: col(/비고|공지/) };
-      if (C.menu < 0) throw new Error('「식단」(또는 메뉴) 열을 찾지 못했습니다.');
-      rows = [];
-      for (let i = h + 1; i < txt.length; i++) {
-        const date = cellToDate((raw[i] || [])[C.date], txt[i][C.date]);
-        const items = String(txt[i][C.menu] || '').replace(/<br\s*\/?>/gi, '\n').split(/\n|,|·/).map((s) => s.trim()).filter(Boolean);
-        if (!date || !items.length) continue;
-        rows.push({ date, items, kcal: C.kcal >= 0 ? String(txt[i][C.kcal]).replace(/[^\d.]/g, '') : '', origin: C.origin >= 0 ? String(txt[i][C.origin]) : '', allergyText: C.allergy >= 0 ? String(txt[i][C.allergy]) : '', note: C.note >= 0 ? String(txt[i][C.note]) : '' });
-      }
-      $('#mlPrev', m).innerHTML = `<p style="margin:14px 0 8px">${rows.length}일치 식단 인식 · 기존 식단은 덮어씁니다.</p><div class="table-wrap"><table class="tbl"><thead><tr><th>날짜</th><th>식단</th><th>칼로리</th></tr></thead><tbody>${rows.map((r) => `<tr><td class="num">${fmtMD(r.date)}${DB.meals[r.date] ? ' <span class="tag orange">덮어씀</span>' : ''}</td><td>${r.items.map(esc).join(', ')}</td><td>${esc(r.kcal)}</td></tr>`).join('')}</tbody></table></div>`;
-      $('#mlGo', m).disabled = !rows.length;
+      src = await readMealSource(f);
+      const d = detectYM(src.texts);
+      const def = T.getDate() > 20 ? addMonths(T, 1) : T;
+      ym = { y: (d && d.y) || (d && d.m < def.getMonth() + 1 - 6 ? def.getFullYear() + 1 : def.getFullYear()), m: (d && d.m) || def.getMonth() + 1 };
+      render();
     } catch (err) { $('#mlPrev', m).innerHTML = `<div class="empty" style="color:var(--red)">${esc(err.message)}</div>`; }
-  });
-  $('#mlGo', m).addEventListener('click', () => {
-    rows.forEach((r) => { DB.meals[r.date] = { items: r.items, kcal: r.kcal, origin: r.origin, allergyText: r.allergyText, note: r.note, updatedBy: ME.id, updatedAt: nowISO() }; });
-    log('import', 'meal', `식단 ${rows.length}일`); notify(`새 급식 식단표가 등록되었습니다. (${rows.length}일)`, 'meal', '#meals/week/' + rows[0].date);
-    saveDB(); closeModal(); toast(`${rows.length}일치 식단이 반영되었습니다.`); location.hash = '#meals/week/' + rows[0].date;
+  };
+  const drop = $('#mlDrop', m); const input = $('input', drop);
+  input.addEventListener('change', () => handle(input.files[0]));
+  drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('drag'); });
+  drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
+  drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('drag'); handle(e.dataTransfer.files[0]); });
+  $('#mlGo', m).addEventListener('click', async () => {
+    const rows = res.rows.filter((r) => !r.off);
+    if (!rows.length) return toast('반영할 날짜를 선택하세요.');
+    $('#mlGo', m).disabled = true;
+    const lastOrigin = DB.meals[Object.keys(DB.meals).sort().pop()]?.origin || '';
+    rows.forEach((r) => { DB.meals[r.date] = { items: r.items, kcal: r.kcal, origin: r.origin || (DB.meals[r.date] && DB.meals[r.date].origin) || lastOrigin, allergyText: r.allergyText, note: r.note, updatedBy: ME.id, updatedAt: nowISO() }; });
+    if ($('#mlKeep', m).checked) { try { await createDoc(file, { title: file.name.replace(/\.[^.]+$/, ''), category: '급식', dept: ME.dept, note: `식단 ${rows.length}일 반영` }, true); } catch (e) { toast('원본 보존 실패: ' + e.message); } }
+    log('import', 'meal', `식단 ${rows.length}일`, file.name);
+    notify(`새 급식 식단표가 등록되었습니다. (${fmtMD(rows[0].date)}~${fmtMD(rows[rows.length - 1].date)}, ${rows.length}일)`, 'meal', '#meals/month/' + rows[0].date);
+    saveDB(); closeModal(); toast(`${rows.length}일치 식단이 반영되었습니다.`); location.hash = '#meals/month/' + rows[0].date;
   });
 };
 
@@ -245,7 +373,7 @@ VIEWS.admin = (v, args) => {
     <div id="adminBody"></div>`;
   ADMIN[tab]($('#adminBody'));
 };
-const ACT_LABEL = { login: '로그인', logout: '로그아웃', view: '열람', download: '다운로드', create: '등록', update: '수정', delete: '삭제', restore: '복구', import: '불러오기', register: '가입 신청', approve: '승인', unlock: '잠금 해제', 'admin-auth': '관리자 인증', 'admin-auth-fail': '관리자 인증 실패', backup: '백업', settings: '설정 변경' };
+const ACT_LABEL = { login: '로그인', logout: '로그아웃', view: '열람', download: '다운로드', create: '등록', update: '수정', delete: '삭제', restore: '복구', import: '불러오기', register: '가입 신청', approve: '승인', unlock: '잠금 해제', 'admin-auth': '관리자 인증', 'admin-auth-fail': '관리자 인증 실패', backup: '백업', settings: '설정 변경', print: '인쇄' };
 const TYPE_LABEL = { doc: '자료', event: '일정', meeting: '회의', notice: '공지', meal: '급식', plan: '업무계획', user: '교직원', session: '세션', dept: '부서', system: '시스템' };
 function logLine(l) { return `<div class="log-line"><time>${fmtFull(l.t).slice(5)}</time><div style="flex:1;min-width:0"><b>${esc(user(l.uid).name)}</b> · ${ACT_LABEL[l.act] || esc(l.act)} <span class="tag">${TYPE_LABEL[l.type] || esc(l.type)}</span> ${esc(l.title)} ${l.extra ? `<span style="color:var(--text-3)">(${esc(l.extra)})</span>` : ''}</div></div>`; }
 const ADMIN = {};

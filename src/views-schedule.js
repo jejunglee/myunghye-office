@@ -253,7 +253,8 @@ function planView(v, type, arg) {
     <div class="page-head"><div><div class="eyebrow">${type === 'week' ? '주중업무계획' : '월중행사계획'}</div><h1>${kindName}</h1></div>
       <div class="actions">
         <button class="btn secondary" data-act="planTemplate">${icon('table', 'width="16" height="16"')}양식</button>
-        <button class="btn secondary" data-act="planExport" data-from="${from}" data-to="${to}" data-type="${type}">${icon('download', 'width="16" height="16"')}엑셀 내려받기</button>
+        <button class="btn secondary" data-act="planOutput" data-from="${from}" data-to="${to}" data-type="${type}">🖨 A4 인쇄</button>
+        <button class="btn secondary" data-act="planOutput" data-from="${from}" data-to="${to}" data-type="${type}">${icon('download', 'width="16" height="16"')}엑셀 저장</button>
         <button class="btn secondary" data-act="planImport" data-kind="${kindName}">${icon('upload', 'width="16" height="16"')}엑셀 불러오기</button>
         <button class="btn" data-act="planAddRow" data-date="${type === 'week' ? ymd(mondayOf(base)) : from}" data-kind="${kindName}">${icon('plus', 'width="16" height="16"')}행 추가</button>
       </div></div>
@@ -492,17 +493,144 @@ ACT.planImport = (d) => {
   });
 };
 
-ACT.planExport = async (d) => {
-  try { await loadLib('XLSX'); } catch (e) { return toast(e.message); }
-  let list = eventsBetween(d.from, d.to);
-  if (d.type === 'month') list = list.filter((e) => e.kind === '월중행사' || e.important);
-  const aoa = [['날짜', '요일', '시간', '업무', '장소', '담당부서', '담당자', '구분'],
-    ...list.map((e) => { const dt = parseYmd(e.date); return [`${dt.getMonth() + 1}.${dt.getDate()}`, DOW[dt.getDay()], e.start ? e.start + (e.end ? '~' + e.end : '') : '', e.title, e.place || '', dept(e.dept).name, e.manager || user(e.owner).name, e.kind]; })];
+/* ---------- 인쇄(A4 세로) · 엑셀 저장 ---------- */
+function schoolYear(d) { return d.getMonth() + 1 >= 3 ? d.getFullYear() : d.getFullYear() - 1; }
+function planInfo(type, from, to) {
+  const f = parseYmd(from);
+  if (type === 'week') {
+    const ws = mondayOf(f);
+    return { kind: '주중업무계획', title: `${schoolYear(ws)}학년도 ${ws.getMonth() + 1}월 ${weekOfMonth(ws)}주 주중업무계획`, period: `${fmtMD(ymd(ws))} ~ ${fmtMD(ymd(addDays(ws, 4)))}` };
+  }
+  return { kind: '월중행사계획', title: `${schoolYear(f)}학년도 ${f.getMonth() + 1}월 월중행사계획`, period: `${f.getFullYear()}. ${f.getMonth() + 1}. 1. ~ ${f.getMonth() + 1}. ${parseYmd(to).getDate()}.` };
+}
+function planOutputEvents(type, from, to, scope) {
+  let list = eventsBetween(from, to);
+  if (type === 'month' && scope !== 'all') list = list.filter((e) => e.kind === '월중행사' || e.important);
+  return list;
+}
+function planDays(type, from, to, list, allDays) {
+  const days = []; const has = new Set(list.map((e) => e.date));
+  for (let d = parseYmd(from); ymd(d) <= to; d = addDays(d, 1)) {
+    const ds = ymd(d); const wkend = d.getDay() === 0 || d.getDay() === 6;
+    if (type === 'week' ? (!wkend || has.has(ds)) : (allDays || has.has(ds))) days.push(ds);
+  }
+  return days;
+}
+const evTime = (e) => (e.start ? e.start + (e.end ? '~' + e.end : '') : '');
+
+function printHeader(info, opt) {
+  const sign = opt.sign ? `<table class="pr-sign"><tr><th rowspan="2">결<br>재</th><th>담당</th><th>부장</th><th>교감</th><th>교장</th></tr><tr><td></td><td></td><td></td><td></td></tr></table>` : '';
+  return `<div class="pr-head${opt.sign ? ' has-sign' : ''}"><div class="pr-title">${esc(info.title)}</div>${sign}</div>
+    <div class="pr-sub"><span>기간: ${esc(info.period)}</span><span>${SCHOOL} · 작성 ${esc(dept(ME.dept).name)} ${esc(ME.name)} · ${fmtKo(today()).replace(/ .요일$/, '')}</span></div>`;
+}
+function printListHtml(type, from, to, list, opt) {
+  const days = planDays(type, from, to, list, opt.allDays);
+  const rows = days.map((ds) => {
+    const d = parseYmd(ds); const evs = list.filter((e) => e.date === ds);
+    const cls = d.getDay() === 0 ? 'sun' : d.getDay() === 6 ? 'sat' : '';
+    const dateCells = (n) => `<td class="c ${cls}" rowspan="${n}">${d.getMonth() + 1}.${d.getDate()}</td><td class="c ${cls}" rowspan="${n}">${DOW[d.getDay()]}</td>`;
+    if (!evs.length) return `<tr class="${cls}">${dateCells(1)}<td></td><td></td><td></td><td></td></tr>`;
+    return evs.map((e, i) => `<tr class="${cls}">${i === 0 ? dateCells(evs.length) : ''}<td class="c">${esc(evTime(e))}</td><td>${e.important ? '★ ' : ''}${esc(e.title)}</td><td>${esc(e.place || '')}</td><td class="c">${esc(dept(e.dept).name)}</td></tr>`).join('');
+  }).join('');
+  return `${printHeader(planInfo(type, from, to), opt)}
+    <table class="pr-table"><colgroup><col style="width:12mm"><col style="width:9mm"><col style="width:21mm"><col><col style="width:25mm"><col style="width:26mm"></colgroup>
+    <thead><tr><th>날짜</th><th>요일</th><th>시간</th><th>${type === 'week' ? '업무 내용' : '행사 내용'}</th><th>장소</th><th>담당</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="6" class="c">등록된 일정이 없습니다.</td></tr>'}</tbody></table>`;
+}
+function printCalendarHtml(from, to, list, opt) {
+  const first = parseYmd(from); const start = addDays(first, -first.getDay());
+  const weeks = [];
+  for (let w = 0; w < 6; w++) {
+    const wk = []; for (let i = 0; i < 7; i++) wk.push(addDays(start, w * 7 + i));
+    if (w > 0 && wk[0].getMonth() !== first.getMonth()) break;
+    weeks.push(wk);
+  }
+  const h = Math.floor(225 / weeks.length);
+  return `${printHeader(planInfo('month', from, to), opt)}
+    <table class="pr-table pr-cal"><thead><tr>${DOW.map((d, i) => `<th class="${i === 0 ? 'sun' : i === 6 ? 'sat' : ''}">${d}</th>`).join('')}</tr></thead>
+    <tbody>${weeks.map((wk) => `<tr>${wk.map((d) => {
+      const ds = ymd(d); const other = d.getMonth() !== first.getMonth();
+      const evs = other ? [] : list.filter((e) => e.date === ds);
+      return `<td style="height:${h}mm" class="${other ? 'other' : ''} ${d.getDay() === 0 ? 'sun' : d.getDay() === 6 ? 'sat' : ''}"><div class="pr-day">${d.getDate()}</div>${evs.map((e) => `<div class="pr-ev">${e.important ? '★' : '·'} ${e.start ? `<b>${esc(e.start)}</b> ` : ''}${esc(e.title)}</div>`).join('')}</td>`;
+    }).join('')}</tr>`).join('')}</tbody></table>`;
+}
+function doPrint(html) {
+  let el = $('#printArea');
+  if (!el) { el = document.createElement('div'); el.id = 'printArea'; document.body.appendChild(el); }
+  el.innerHTML = html; el.style.zoom = '';
+  // A4 한 장(인쇄 영역 약 188×272mm)을 조금 넘으면 자동으로 줄여서 한 장에 맞춤 (70%까지, 더 많으면 여러 쪽)
+  el.style.cssText = 'display:block;position:absolute;left:-10000px;top:0;width:188mm';
+  const mm = el.getBoundingClientRect().height * 25.4 / 96;
+  window.__printMM = mm;
+  el.style.cssText = '';
+  if (mm > 268 && mm < 268 / 0.7) el.style.zoom = String(Math.floor((268 / mm) * 100) / 100);
+  setTimeout(() => window.print(), 60);
+}
+window.addEventListener('afterprint', () => { const el = $('#printArea'); if (el) el.innerHTML = ''; });
+
+async function planExcel(type, from, to, list, opt) {
+  await loadLib('XLSX');
+  const info = planInfo(type, from, to);
+  const head = ['날짜', '요일', '시간', type === 'week' ? '업무 내용' : '행사 내용', '장소', '담당부서', '담당자', '구분'];
+  const aoa = [[info.title], [`기간: ${info.period}`, '', '', '', '', `작성: ${dept(ME.dept).name} ${ME.name} (${todayStr()})`], [], head];
+  planDays(type, from, to, list, opt.allDays).forEach((ds) => {
+    const d = parseYmd(ds); const evs = list.filter((e) => e.date === ds); const md = `${d.getMonth() + 1}.${d.getDate()}`;
+    if (!evs.length) aoa.push([md, DOW[d.getDay()], '', '', '', '', '', '']);
+    evs.forEach((e) => aoa.push([md, DOW[d.getDay()], evTime(e), (e.important ? '★ ' : '') + e.title, e.place || '', dept(e.dept).name, e.manager || user(e.owner).name, e.kind]));
+  });
   const ws = XLSX.utils.aoa_to_sheet(aoa);
-  ws['!cols'] = [{ wch: 8 }, { wch: 5 }, { wch: 13 }, { wch: 34 }, { wch: 16 }, { wch: 12 }, { wch: 10 }, { wch: 10 }];
-  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, d.type === 'week' ? '주중업무계획' : '월중행사계획');
-  XLSX.writeFile(wb, `${SCHOOL}_${d.type === 'week' ? '주중업무계획' : '월중행사계획'}_${d.from}.xlsx`);
-  log('download', 'plan', d.from);
+  ws['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 7 } }, { s: { r: 1, c: 0 }, e: { r: 1, c: 4 } }, { s: { r: 1, c: 5 }, e: { r: 1, c: 7 } }];
+  ws['!cols'] = [{ wch: 7 }, { wch: 5 }, { wch: 13 }, { wch: 38 }, { wch: 16 }, { wch: 13 }, { wch: 10 }, { wch: 9 }];
+  ws['!rows'] = [{ hpt: 28 }];
+  ws['!autofilter'] = { ref: `A4:H${aoa.length}` };
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, type === 'week' ? '주중업무계획' : '월중행사계획');
+  if (type === 'month') {
+    const first = parseYmd(from); const start = addDays(first, -first.getDay());
+    const cal = [[info.title], [], DOW.slice()];
+    for (let w = 0; w < 6; w++) {
+      const row = [];
+      for (let i = 0; i < 7; i++) {
+        const d = addDays(start, w * 7 + i);
+        if (d.getMonth() !== first.getMonth()) { row.push(''); continue; }
+        const evs = list.filter((e) => e.date === ymd(d));
+        row.push([String(d.getDate()), ...evs.map((e) => `${e.start ? e.start + ' ' : ''}${e.title}`)].join('\n'));
+      }
+      if (w > 0 && row.every((x) => !x)) break;
+      cal.push(row);
+    }
+    const cs = XLSX.utils.aoa_to_sheet(cal);
+    cs['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 6 } }];
+    cs['!cols'] = DOW.map(() => ({ wch: 20 }));
+    cs['!rows'] = [{ hpt: 28 }, {}, {}, ...Array(6).fill({ hpt: 90 })];
+    XLSX.utils.book_append_sheet(wb, cs, '달력');
+  }
+  XLSX.writeFile(wb, `${SCHOOL}_${info.title.replace(/\s+/g, '_')}.xlsx`);
+  log('download', 'plan', info.title);
+}
+
+ACT.planOutput = (d) => {
+  const type = d.type; const isMonth = type === 'month';
+  const m = openModal({
+    title: `${isMonth ? '월중행사계획' : '주중업무계획'} 인쇄 · 엑셀 저장`,
+    body: `<form id="poForm">
+      ${isMonth ? `<div class="row"><div class="field"><label>양식</label><select class="input" name="layout"><option value="list">목록형 (날짜별 표)</option><option value="cal">달력형 (한 달 달력)</option></select></div>
+        <div class="field"><label>포함할 일정</label><select class="input" name="scope"><option value="screen">월중행사·중요 일정 (화면과 같음)</option><option value="all">모든 일정 (주중업무·회의 포함)</option></select></div></div>
+        <label class="check" style="margin-bottom:8px"><input type="checkbox" name="allDays" checked> 일정이 없는 날짜도 표시 (목록형)</label>` : ''}
+      <label class="check"><input type="checkbox" name="sign"> 결재란 표시 (담당 · 부장 · 교감 · 교장)</label>
+      <p style="font-size:12.5px;color:var(--text-3);margin-top:14px;line-height:1.6">🖨 A4 세로로 맞춰 인쇄됩니다. 인쇄 창의 「대상」에서 <b>PDF로 저장</b>을 고르면 PDF 파일로도 저장할 수 있습니다.<br>📊 엑셀 파일에는 ${isMonth ? '목록 시트와 달력 시트가 함께' : '목록 시트가'} 들어갑니다.</p></form>`,
+    foot: `<button class="btn secondary" id="poXls">${icon('download', 'width="16" height="16"')}엑셀로 저장</button><button class="btn" id="poPrint">🖨 A4 인쇄</button>`,
+  });
+  const opts = () => { const f = formData($('#poForm', m)); return { layout: f.layout || 'list', scope: f.scope || 'screen', allDays: isMonth ? !!f.allDays : false, sign: !!f.sign }; };
+  $('#poPrint', m).addEventListener('click', () => {
+    const o = opts(); const list = planOutputEvents(type, d.from, d.to, o.scope);
+    const html = isMonth && o.layout === 'cal' ? printCalendarHtml(d.from, d.to, list, o) : printListHtml(type, d.from, d.to, list, o);
+    closeModal(); log('print', 'plan', planInfo(type, d.from, d.to).title); saveDB(); doPrint(html);
+  });
+  $('#poXls', m).addEventListener('click', async () => {
+    const o = opts();
+    try { await planExcel(type, d.from, d.to, planOutputEvents(type, d.from, d.to, o.scope), o); closeModal(); toast('엑셀 파일을 저장했습니다.'); saveDB(); }
+    catch (e) { toast(e.message); }
+  });
 };
 ACT.planTemplate = async () => {
   try { await loadLib('XLSX'); } catch (e) { return toast(e.message); }

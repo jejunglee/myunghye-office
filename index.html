@@ -558,6 +558,36 @@ mark { background: rgba(255, 204, 0, .4); color: inherit; border-radius: 3px; pa
 .sync { width: 8px; height: 8px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
 .sync.error { background: var(--red); box-shadow: 0 0 0 4px rgba(255,59,48,.15); }
 
+/* ---------- A4 인쇄 ---------- */
+#printArea { display: none; color: #000; font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif; font-size: 10pt; line-height: 1.35; letter-spacing: 0; }
+@media print {
+  @page { size: A4 portrait; margin: 12mm 11mm 13mm; }
+  html, body { background: #fff !important; height: auto; }
+  body > *:not(#printArea) { display: none !important; }
+  #printArea { display: block !important; color: #000; font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+}
+#printArea .pr-head { display: flex; align-items: center; gap: 4mm; min-height: 12mm; margin-bottom: 2mm; }
+#printArea .pr-head.has-sign .pr-title { text-align: left; }
+#printArea .pr-title { font-size: 16pt; font-weight: 800; letter-spacing: -0.02em; text-align: center; flex: 1; }
+#printArea .pr-sign { border-collapse: collapse; font-size: 8.5pt; flex-shrink: 0; }
+#printArea .pr-sign th, #printArea .pr-sign td { border: 0.6pt solid #000; text-align: center; padding: 0.8mm 1mm; width: 15mm; }
+#printArea .pr-sign th:first-child { width: 7mm; min-width: 7mm; line-height: 1.4; padding: 0.5mm; }
+#printArea .pr-sign td { height: 12mm; }
+#printArea .pr-sub { display: flex; justify-content: space-between; font-size: 9pt; margin-bottom: 2.5mm; color: #222; }
+#printArea .pr-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 9pt; line-height: 1.28; }
+#printArea .pr-table th, #printArea .pr-table td { border: 0.6pt solid #333; padding: 0.9mm 1.5mm; vertical-align: middle; word-break: keep-all; overflow-wrap: anywhere; }
+#printArea .pr-table thead th { background: #e9e9ec; font-weight: 700; text-align: center; border-top: 1.2pt solid #000; border-bottom: 1pt solid #000; }
+#printArea .pr-table tr { break-inside: avoid; page-break-inside: avoid; }
+#printArea .pr-table td.c { text-align: center; padding-left: 0.6mm; padding-right: 0.6mm; }
+#printArea .pr-table thead th { padding-left: 0.6mm; padding-right: 0.6mm; white-space: nowrap; }
+#printArea .pr-table tr.sun td, #printArea .pr-table tr.sat td { background: #f6f6f8; }
+#printArea .pr-table .sun { color: #c00; }
+#printArea .pr-table .sat { color: #0047b3; }
+#printArea .pr-cal td { vertical-align: top; padding: 1mm 1.3mm; font-size: 8pt; overflow: hidden; }
+#printArea .pr-cal td.other { background: #f3f3f3; }
+#printArea .pr-cal .pr-day { font-weight: 800; font-size: 10pt; margin-bottom: 0.8mm; }
+#printArea .pr-cal .pr-ev { color: #000; line-height: 1.3; margin-bottom: 0.6mm; }
+
 </style>
 </head>
 <body>
@@ -1379,6 +1409,143 @@ async function boot() {
 }
 
 /* =========================================================
+   한글 문서 해석 — HWP(5.0 바이너리) · HWPX(XML)
+   문단과 표(셀 위치·병합 포함)를 꺼내 미리보기·검색·식단 반영에 쓴다.
+   ========================================================= */
+
+/* 표 셀 목록 → 2차원 격자(병합 셀은 왼쪽 위 칸에만 글자) */
+function cellsToGrid(cells) {
+  let R = 0; let C = 0;
+  cells.forEach((c) => { R = Math.max(R, c.row + (c.rs || 1)); C = Math.max(C, c.col + (c.cs || 1)); });
+  const g = Array.from({ length: R }, () => Array(C).fill(''));
+  cells.forEach((c) => { if (g[c.row]) g[c.row][c.col] = c.text; });
+  return g;
+}
+function cellsToHtml(cells) {
+  const rows = {};
+  cells.forEach((c) => { (rows[c.row] = rows[c.row] || []).push(c); });
+  return `<table>${Object.keys(rows).map(Number).sort((a, b) => a - b).map((r) => `<tr>${rows[r].sort((a, b) => a.col - b.col).map((c) =>
+    `<td${c.cs > 1 ? ` colspan="${c.cs}"` : ''}${c.rs > 1 ? ` rowspan="${c.rs}"` : ''}>${esc(c.text).replace(/\n/g, '<br>')}</td>`).join('')}</tr>`).join('')}</table>`;
+}
+
+/* ---------- HWP 5.0 ---------- */
+async function inflateRaw(u8) {
+  if (typeof DecompressionStream === 'undefined') throw new Error('이 브라우저는 한글 파일 해석을 지원하지 않습니다. 최신 크롬·엣지·사파리를 사용하세요.');
+  // 한글 파일은 압축 데이터 뒤에 여분 바이트가 붙는 경우가 있어, 풀린 데까지 모아서 사용
+  const ds = new DecompressionStream('deflate-raw');
+  const w = ds.writable.getWriter(); w.write(u8).catch(() => {}); w.close().catch(() => {});
+  const reader = ds.readable.getReader(); const chunks = []; let total = 0;
+  try { for (;;) { const { value, done } = await reader.read(); if (done) break; chunks.push(value); total += value.length; } }
+  catch (e) { if (!total) throw new Error('한글 파일 본문의 압축을 풀 수 없습니다.'); }
+  const out = new Uint8Array(total); let o = 0; chunks.forEach((c) => { out.set(c, o); o += c.length; });
+  return out;
+}
+const HWP_CTRL_SKIP = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]);
+function hwpText(u8, off, len) {
+  let s = '';
+  for (let i = off; i + 1 < off + len; i += 2) {
+    const c = u8[i] | (u8[i + 1] << 8);
+    if (c >= 32) { s += String.fromCharCode(c); continue; }
+    if (HWP_CTRL_SKIP.has(c)) { if (c === 9) s += '\t'; i += 14; continue; }   // 확장·인라인 컨트롤은 8글자(16바이트)
+    if (c === 10) s += '\n'; else if (c === 30 || c === 31) s += ' ';
+  }
+  return s;
+}
+const TAG_PARA_HEADER = 66; const TAG_PARA_TEXT = 67; const TAG_CTRL_HEADER = 71; const TAG_LIST_HEADER = 72;
+const CTRL_TABLE = 0x74626c20; // 'tbl '
+
+async function parseHwpDoc(blob) {
+  await loadLib('XLSX');
+  const cfb = XLSX.CFB.read(new Uint8Array(await blob.arrayBuffer()), { type: 'array' });
+  const fh = XLSX.CFB.find(cfb, 'FileHeader');
+  if (!fh || !fh.content) throw new Error('한글(HWP) 파일 형식이 아닙니다.');
+  const h = new Uint8Array(fh.content);
+  const flags = (h[36] | (h[37] << 8) | (h[38] << 16) | (h[39] << 24)) >>> 0;
+  if (flags & 2) throw new Error('암호가 설정된 한글 파일은 읽을 수 없습니다.');
+  if (flags & 4) throw new Error('배포용 한글 문서는 읽을 수 없습니다. 한글에서 「다른 이름으로 저장」 후 다시 올려 주세요.');
+  const compressed = !!(flags & 1);
+  const secs = cfb.FullPaths.map((p, i) => [p, i]).filter(([p]) => /BodyText\/Section\d+$/i.test(p))
+    .sort((a, b) => +a[0].match(/(\d+)$/)[1] - +b[0].match(/(\d+)$/)[1]);
+  if (!secs.length) throw new Error('본문을 찾을 수 없습니다.');
+  const blocks = [];
+  for (const [, idx] of secs) {
+    let data = new Uint8Array(cfb.FileIndex[idx].content);
+    if (compressed) data = await inflateRaw(data);
+    const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    let pos = 0; let tbl = null; let cell = null;
+    const endTable = () => { if (tbl) { if (tbl.cells.length) blocks.push({ type: 'table', cells: tbl.cells }); tbl = null; cell = null; } };
+    while (pos + 4 <= data.length) {
+      const hdr = dv.getUint32(pos, true); pos += 4;
+      const tag = hdr & 0x3ff; const level = (hdr >>> 10) & 0x3ff; let size = (hdr >>> 20) & 0xfff;
+      if (size === 0xfff) { if (pos + 4 > data.length) break; size = dv.getUint32(pos, true); pos += 4; }
+      const off = pos; pos += size;
+      if (pos > data.length) break;
+      if (tag === TAG_PARA_HEADER) { if (tbl && level < tbl.cellLevel) endTable(); }
+      else if (tag === TAG_CTRL_HEADER && size >= 4) {
+        if (!tbl && dv.getUint32(off, true) === CTRL_TABLE) tbl = { cellLevel: level + 1, cells: [] };
+      } else if (tag === TAG_LIST_HEADER && tbl && level === tbl.cellLevel && size >= 16) {
+        // 문단 수(2) · 알수없음(2) · 속성(4) · 열(2) · 행(2) · 열병합(2) · 행병합(2)
+        let col = dv.getUint16(off + 8, true); let row = dv.getUint16(off + 10, true);
+        let cs = dv.getUint16(off + 12, true); let rs = dv.getUint16(off + 14, true);
+        if (col > 200 || row > 2000 || cs > 200 || rs > 2000) { col = dv.getUint16(off + 6, true); row = dv.getUint16(off + 8, true); cs = dv.getUint16(off + 10, true); rs = dv.getUint16(off + 12, true); }
+        cell = { row, col, cs: cs || 1, rs: rs || 1, text: '' };
+        tbl.cells.push(cell);
+      } else if (tag === TAG_PARA_TEXT) {
+        const t = hwpText(data, off, size).replace(/\s+$/, '');
+        if (tbl && cell && level > tbl.cellLevel) cell.text += (cell.text ? '\n' : '') + t;
+        else if (!tbl) blocks.push({ type: 'p', text: t });
+      }
+    }
+    endTable();
+  }
+  return docFromBlocks(blocks);
+}
+
+/* ---------- HWPX (OWPML) ---------- */
+async function parseHwpxDoc(blob) {
+  await loadLib('JSZip');
+  const zip = await JSZip.loadAsync(blob);
+  const secs = Object.keys(zip.files).filter((f) => /Contents\/section\d+\.xml$/i.test(f)).sort((a, b) => parseInt(a.match(/(\d+)\.xml/)[1], 10) - parseInt(b.match(/(\d+)\.xml/)[1], 10));
+  const blocks = [];
+  const pText = (p) => { let s = ''; (function r(n) { for (const c of n.children) { if (c.localName === 'tbl') continue; if (c.localName === 't') s += c.textContent; else if (c.localName === 'tab') s += '\t'; else if (c.localName === 'lineBreak') s += '\n'; else r(c); } })(p); return s; };
+  const tblCells = (t) => {
+    const cells = []; let ri = 0;
+    [...t.children].filter((c) => c.localName === 'tr').forEach((tr) => {
+      let ci = 0;
+      [...tr.children].filter((c) => c.localName === 'tc').forEach((tc) => {
+        const addr = [...tc.children].find((c) => c.localName === 'cellAddr');
+        const span = [...tc.children].find((c) => c.localName === 'cellSpan');
+        const col = addr ? +addr.getAttribute('colAddr') : ci; const row = addr ? +addr.getAttribute('rowAddr') : ri;
+        const texts = [...tc.getElementsByTagNameNS('*', 'p')].map(pText).filter((x) => x.trim());
+        cells.push({ row, col, cs: span ? +span.getAttribute('colSpan') || 1 : 1, rs: span ? +span.getAttribute('rowSpan') || 1 : 1, text: texts.join('\n') });
+        ci++;
+      });
+      ri++;
+    });
+    return cells;
+  };
+  const walk = (node) => {
+    for (const ch of node.children) {
+      if (ch.localName === 'tbl') blocks.push({ type: 'table', cells: tblCells(ch) });
+      else if (ch.localName === 'p') {
+        blocks.push({ type: 'p', text: pText(ch) });
+        (function r(n) { for (const c of n.children) { if (c.localName === 'tbl') blocks.push({ type: 'table', cells: tblCells(c) }); else if (c.localName !== 't') r(c); } })(ch);
+      } else walk(ch);
+    }
+  };
+  for (const f of secs) walk(new DOMParser().parseFromString(await zip.file(f).async('string'), 'application/xml').documentElement);
+  return docFromBlocks(blocks);
+}
+
+function docFromBlocks(blocks) {
+  const html = blocks.map((b) => b.type === 'p' ? (b.text.trim() ? `<p>${esc(b.text).replace(/\n/g, '<br>')}</p>` : '<p>&nbsp;</p>') : cellsToHtml(b.cells)).join('');
+  const text = blocks.map((b) => b.type === 'p' ? b.text : b.cells.map((c) => c.text).join(' ')).join('\n');
+  const tables = blocks.filter((b) => b.type === 'table').map((b) => cellsToGrid(b.cells));
+  const paras = blocks.filter((b) => b.type === 'p').map((b) => b.text);
+  return { html, text, tables, paras };
+}
+
+/* =========================================================
    홈(오늘의 명혜) · 통합 일정 · 주중/월중 업무계획
    ========================================================= */
 
@@ -1633,7 +1800,8 @@ function planView(v, type, arg) {
     <div class="page-head"><div><div class="eyebrow">${type === 'week' ? '주중업무계획' : '월중행사계획'}</div><h1>${kindName}</h1></div>
       <div class="actions">
         <button class="btn secondary" data-act="planTemplate">${icon('table', 'width="16" height="16"')}양식</button>
-        <button class="btn secondary" data-act="planExport" data-from="${from}" data-to="${to}" data-type="${type}">${icon('download', 'width="16" height="16"')}엑셀 내려받기</button>
+        <button class="btn secondary" data-act="planOutput" data-from="${from}" data-to="${to}" data-type="${type}">🖨 A4 인쇄</button>
+        <button class="btn secondary" data-act="planOutput" data-from="${from}" data-to="${to}" data-type="${type}">${icon('download', 'width="16" height="16"')}엑셀 저장</button>
         <button class="btn secondary" data-act="planImport" data-kind="${kindName}">${icon('upload', 'width="16" height="16"')}엑셀 불러오기</button>
         <button class="btn" data-act="planAddRow" data-date="${type === 'week' ? ymd(mondayOf(base)) : from}" data-kind="${kindName}">${icon('plus', 'width="16" height="16"')}행 추가</button>
       </div></div>
@@ -1872,17 +2040,144 @@ ACT.planImport = (d) => {
   });
 };
 
-ACT.planExport = async (d) => {
-  try { await loadLib('XLSX'); } catch (e) { return toast(e.message); }
-  let list = eventsBetween(d.from, d.to);
-  if (d.type === 'month') list = list.filter((e) => e.kind === '월중행사' || e.important);
-  const aoa = [['날짜', '요일', '시간', '업무', '장소', '담당부서', '담당자', '구분'],
-    ...list.map((e) => { const dt = parseYmd(e.date); return [`${dt.getMonth() + 1}.${dt.getDate()}`, DOW[dt.getDay()], e.start ? e.start + (e.end ? '~' + e.end : '') : '', e.title, e.place || '', dept(e.dept).name, e.manager || user(e.owner).name, e.kind]; })];
+/* ---------- 인쇄(A4 세로) · 엑셀 저장 ---------- */
+function schoolYear(d) { return d.getMonth() + 1 >= 3 ? d.getFullYear() : d.getFullYear() - 1; }
+function planInfo(type, from, to) {
+  const f = parseYmd(from);
+  if (type === 'week') {
+    const ws = mondayOf(f);
+    return { kind: '주중업무계획', title: `${schoolYear(ws)}학년도 ${ws.getMonth() + 1}월 ${weekOfMonth(ws)}주 주중업무계획`, period: `${fmtMD(ymd(ws))} ~ ${fmtMD(ymd(addDays(ws, 4)))}` };
+  }
+  return { kind: '월중행사계획', title: `${schoolYear(f)}학년도 ${f.getMonth() + 1}월 월중행사계획`, period: `${f.getFullYear()}. ${f.getMonth() + 1}. 1. ~ ${f.getMonth() + 1}. ${parseYmd(to).getDate()}.` };
+}
+function planOutputEvents(type, from, to, scope) {
+  let list = eventsBetween(from, to);
+  if (type === 'month' && scope !== 'all') list = list.filter((e) => e.kind === '월중행사' || e.important);
+  return list;
+}
+function planDays(type, from, to, list, allDays) {
+  const days = []; const has = new Set(list.map((e) => e.date));
+  for (let d = parseYmd(from); ymd(d) <= to; d = addDays(d, 1)) {
+    const ds = ymd(d); const wkend = d.getDay() === 0 || d.getDay() === 6;
+    if (type === 'week' ? (!wkend || has.has(ds)) : (allDays || has.has(ds))) days.push(ds);
+  }
+  return days;
+}
+const evTime = (e) => (e.start ? e.start + (e.end ? '~' + e.end : '') : '');
+
+function printHeader(info, opt) {
+  const sign = opt.sign ? `<table class="pr-sign"><tr><th rowspan="2">결<br>재</th><th>담당</th><th>부장</th><th>교감</th><th>교장</th></tr><tr><td></td><td></td><td></td><td></td></tr></table>` : '';
+  return `<div class="pr-head${opt.sign ? ' has-sign' : ''}"><div class="pr-title">${esc(info.title)}</div>${sign}</div>
+    <div class="pr-sub"><span>기간: ${esc(info.period)}</span><span>${SCHOOL} · 작성 ${esc(dept(ME.dept).name)} ${esc(ME.name)} · ${fmtKo(today()).replace(/ .요일$/, '')}</span></div>`;
+}
+function printListHtml(type, from, to, list, opt) {
+  const days = planDays(type, from, to, list, opt.allDays);
+  const rows = days.map((ds) => {
+    const d = parseYmd(ds); const evs = list.filter((e) => e.date === ds);
+    const cls = d.getDay() === 0 ? 'sun' : d.getDay() === 6 ? 'sat' : '';
+    const dateCells = (n) => `<td class="c ${cls}" rowspan="${n}">${d.getMonth() + 1}.${d.getDate()}</td><td class="c ${cls}" rowspan="${n}">${DOW[d.getDay()]}</td>`;
+    if (!evs.length) return `<tr class="${cls}">${dateCells(1)}<td></td><td></td><td></td><td></td></tr>`;
+    return evs.map((e, i) => `<tr class="${cls}">${i === 0 ? dateCells(evs.length) : ''}<td class="c">${esc(evTime(e))}</td><td>${e.important ? '★ ' : ''}${esc(e.title)}</td><td>${esc(e.place || '')}</td><td class="c">${esc(dept(e.dept).name)}</td></tr>`).join('');
+  }).join('');
+  return `${printHeader(planInfo(type, from, to), opt)}
+    <table class="pr-table"><colgroup><col style="width:12mm"><col style="width:9mm"><col style="width:21mm"><col><col style="width:25mm"><col style="width:26mm"></colgroup>
+    <thead><tr><th>날짜</th><th>요일</th><th>시간</th><th>${type === 'week' ? '업무 내용' : '행사 내용'}</th><th>장소</th><th>담당</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="6" class="c">등록된 일정이 없습니다.</td></tr>'}</tbody></table>`;
+}
+function printCalendarHtml(from, to, list, opt) {
+  const first = parseYmd(from); const start = addDays(first, -first.getDay());
+  const weeks = [];
+  for (let w = 0; w < 6; w++) {
+    const wk = []; for (let i = 0; i < 7; i++) wk.push(addDays(start, w * 7 + i));
+    if (w > 0 && wk[0].getMonth() !== first.getMonth()) break;
+    weeks.push(wk);
+  }
+  const h = Math.floor(225 / weeks.length);
+  return `${printHeader(planInfo('month', from, to), opt)}
+    <table class="pr-table pr-cal"><thead><tr>${DOW.map((d, i) => `<th class="${i === 0 ? 'sun' : i === 6 ? 'sat' : ''}">${d}</th>`).join('')}</tr></thead>
+    <tbody>${weeks.map((wk) => `<tr>${wk.map((d) => {
+      const ds = ymd(d); const other = d.getMonth() !== first.getMonth();
+      const evs = other ? [] : list.filter((e) => e.date === ds);
+      return `<td style="height:${h}mm" class="${other ? 'other' : ''} ${d.getDay() === 0 ? 'sun' : d.getDay() === 6 ? 'sat' : ''}"><div class="pr-day">${d.getDate()}</div>${evs.map((e) => `<div class="pr-ev">${e.important ? '★' : '·'} ${e.start ? `<b>${esc(e.start)}</b> ` : ''}${esc(e.title)}</div>`).join('')}</td>`;
+    }).join('')}</tr>`).join('')}</tbody></table>`;
+}
+function doPrint(html) {
+  let el = $('#printArea');
+  if (!el) { el = document.createElement('div'); el.id = 'printArea'; document.body.appendChild(el); }
+  el.innerHTML = html; el.style.zoom = '';
+  // A4 한 장(인쇄 영역 약 188×272mm)을 조금 넘으면 자동으로 줄여서 한 장에 맞춤 (70%까지, 더 많으면 여러 쪽)
+  el.style.cssText = 'display:block;position:absolute;left:-10000px;top:0;width:188mm';
+  const mm = el.getBoundingClientRect().height * 25.4 / 96;
+  window.__printMM = mm;
+  el.style.cssText = '';
+  if (mm > 268 && mm < 268 / 0.7) el.style.zoom = String(Math.floor((268 / mm) * 100) / 100);
+  setTimeout(() => window.print(), 60);
+}
+window.addEventListener('afterprint', () => { const el = $('#printArea'); if (el) el.innerHTML = ''; });
+
+async function planExcel(type, from, to, list, opt) {
+  await loadLib('XLSX');
+  const info = planInfo(type, from, to);
+  const head = ['날짜', '요일', '시간', type === 'week' ? '업무 내용' : '행사 내용', '장소', '담당부서', '담당자', '구분'];
+  const aoa = [[info.title], [`기간: ${info.period}`, '', '', '', '', `작성: ${dept(ME.dept).name} ${ME.name} (${todayStr()})`], [], head];
+  planDays(type, from, to, list, opt.allDays).forEach((ds) => {
+    const d = parseYmd(ds); const evs = list.filter((e) => e.date === ds); const md = `${d.getMonth() + 1}.${d.getDate()}`;
+    if (!evs.length) aoa.push([md, DOW[d.getDay()], '', '', '', '', '', '']);
+    evs.forEach((e) => aoa.push([md, DOW[d.getDay()], evTime(e), (e.important ? '★ ' : '') + e.title, e.place || '', dept(e.dept).name, e.manager || user(e.owner).name, e.kind]));
+  });
   const ws = XLSX.utils.aoa_to_sheet(aoa);
-  ws['!cols'] = [{ wch: 8 }, { wch: 5 }, { wch: 13 }, { wch: 34 }, { wch: 16 }, { wch: 12 }, { wch: 10 }, { wch: 10 }];
-  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, d.type === 'week' ? '주중업무계획' : '월중행사계획');
-  XLSX.writeFile(wb, `${SCHOOL}_${d.type === 'week' ? '주중업무계획' : '월중행사계획'}_${d.from}.xlsx`);
-  log('download', 'plan', d.from);
+  ws['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 7 } }, { s: { r: 1, c: 0 }, e: { r: 1, c: 4 } }, { s: { r: 1, c: 5 }, e: { r: 1, c: 7 } }];
+  ws['!cols'] = [{ wch: 7 }, { wch: 5 }, { wch: 13 }, { wch: 38 }, { wch: 16 }, { wch: 13 }, { wch: 10 }, { wch: 9 }];
+  ws['!rows'] = [{ hpt: 28 }];
+  ws['!autofilter'] = { ref: `A4:H${aoa.length}` };
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, type === 'week' ? '주중업무계획' : '월중행사계획');
+  if (type === 'month') {
+    const first = parseYmd(from); const start = addDays(first, -first.getDay());
+    const cal = [[info.title], [], DOW.slice()];
+    for (let w = 0; w < 6; w++) {
+      const row = [];
+      for (let i = 0; i < 7; i++) {
+        const d = addDays(start, w * 7 + i);
+        if (d.getMonth() !== first.getMonth()) { row.push(''); continue; }
+        const evs = list.filter((e) => e.date === ymd(d));
+        row.push([String(d.getDate()), ...evs.map((e) => `${e.start ? e.start + ' ' : ''}${e.title}`)].join('\n'));
+      }
+      if (w > 0 && row.every((x) => !x)) break;
+      cal.push(row);
+    }
+    const cs = XLSX.utils.aoa_to_sheet(cal);
+    cs['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 6 } }];
+    cs['!cols'] = DOW.map(() => ({ wch: 20 }));
+    cs['!rows'] = [{ hpt: 28 }, {}, {}, ...Array(6).fill({ hpt: 90 })];
+    XLSX.utils.book_append_sheet(wb, cs, '달력');
+  }
+  XLSX.writeFile(wb, `${SCHOOL}_${info.title.replace(/\s+/g, '_')}.xlsx`);
+  log('download', 'plan', info.title);
+}
+
+ACT.planOutput = (d) => {
+  const type = d.type; const isMonth = type === 'month';
+  const m = openModal({
+    title: `${isMonth ? '월중행사계획' : '주중업무계획'} 인쇄 · 엑셀 저장`,
+    body: `<form id="poForm">
+      ${isMonth ? `<div class="row"><div class="field"><label>양식</label><select class="input" name="layout"><option value="list">목록형 (날짜별 표)</option><option value="cal">달력형 (한 달 달력)</option></select></div>
+        <div class="field"><label>포함할 일정</label><select class="input" name="scope"><option value="screen">월중행사·중요 일정 (화면과 같음)</option><option value="all">모든 일정 (주중업무·회의 포함)</option></select></div></div>
+        <label class="check" style="margin-bottom:8px"><input type="checkbox" name="allDays" checked> 일정이 없는 날짜도 표시 (목록형)</label>` : ''}
+      <label class="check"><input type="checkbox" name="sign"> 결재란 표시 (담당 · 부장 · 교감 · 교장)</label>
+      <p style="font-size:12.5px;color:var(--text-3);margin-top:14px;line-height:1.6">🖨 A4 세로로 맞춰 인쇄됩니다. 인쇄 창의 「대상」에서 <b>PDF로 저장</b>을 고르면 PDF 파일로도 저장할 수 있습니다.<br>📊 엑셀 파일에는 ${isMonth ? '목록 시트와 달력 시트가 함께' : '목록 시트가'} 들어갑니다.</p></form>`,
+    foot: `<button class="btn secondary" id="poXls">${icon('download', 'width="16" height="16"')}엑셀로 저장</button><button class="btn" id="poPrint">🖨 A4 인쇄</button>`,
+  });
+  const opts = () => { const f = formData($('#poForm', m)); return { layout: f.layout || 'list', scope: f.scope || 'screen', allDays: isMonth ? !!f.allDays : false, sign: !!f.sign }; };
+  $('#poPrint', m).addEventListener('click', () => {
+    const o = opts(); const list = planOutputEvents(type, d.from, d.to, o.scope);
+    const html = isMonth && o.layout === 'cal' ? printCalendarHtml(d.from, d.to, list, o) : printListHtml(type, d.from, d.to, list, o);
+    closeModal(); log('print', 'plan', planInfo(type, d.from, d.to).title); saveDB(); doPrint(html);
+  });
+  $('#poXls', m).addEventListener('click', async () => {
+    const o = opts();
+    try { await planExcel(type, d.from, d.to, planOutputEvents(type, d.from, d.to, o.scope), o); closeModal(); toast('엑셀 파일을 저장했습니다.'); saveDB(); }
+    catch (e) { toast(e.message); }
+  });
 };
 ACT.planTemplate = async () => {
   try { await loadLib('XLSX'); } catch (e) { return toast(e.message); }
@@ -1912,46 +2207,13 @@ async function extractText(blob, name) {
       return wb.SheetNames.map((n) => XLSX.utils.sheet_to_csv(wb.Sheets[n])).join('\n').slice(0, 30000);
     }
     if (ext === 'docx') { await loadLib('mammoth'); const r = await mammoth.extractRawText({ arrayBuffer: await blob.arrayBuffer() }); return r.value.slice(0, 30000); }
-    if (ext === 'hwpx') { const r = await parseHwpx(blob); return r.text.slice(0, 30000); }
+    if (ext === 'hwpx') { const r = await parseHwpxDoc(blob); return r.text.slice(0, 30000); }
     if (ext === 'pptx') { const s = await parsePptx(blob); return s.map((x) => x.join('\n')).join('\n').slice(0, 30000); }
-    if (ext === 'hwp') { const r = await parseHwp(blob); return (r.text || '').slice(0, 30000); }
+    if (ext === 'hwp') { try { const r = await parseHwpDoc(blob); return r.text.slice(0, 30000); } catch (e) { const r = await parseHwp(blob); return (r.text || '').slice(0, 30000); } }
   } catch (e) { console.warn('텍스트 추출 실패', name, e); }
   return '';
 }
 
-/* HWPX: ZIP + XML (OWPML) → 문단·표 구조 추출 */
-async function parseHwpx(blob) {
-  await loadLib('JSZip');
-  const zip = await JSZip.loadAsync(blob);
-  const secs = Object.keys(zip.files).filter((f) => /Contents\/section\d+\.xml$/i.test(f)).sort((a, b) => parseInt(a.match(/(\d+)\.xml/)[1], 10) - parseInt(b.match(/(\d+)\.xml/)[1], 10));
-  const html = []; const text = [];
-  for (const f of secs) {
-    const xml = new DOMParser().parseFromString(await zip.file(f).async('string'), 'application/xml');
-    walk(xml.documentElement);
-  }
-  return { html: html.join(''), text: text.join('\n') };
-
-  function pText(p) { let s = ''; (function r(n) { for (const c of n.children) { if (c.localName === 'tbl') continue; if (c.localName === 't') s += c.textContent; else if (c.localName === 'tab') s += '\t'; else r(c); } })(p); return s; }
-  function walk(node) {
-    for (const ch of node.children) {
-      if (ch.localName === 'tbl') html.push(tbl(ch));
-      else if (ch.localName === 'p') {
-        const t = pText(ch); if (t.trim()) { html.push(`<p>${esc(t)}</p>`); text.push(t); } else html.push('<p>&nbsp;</p>');
-        (function r(n) { for (const c of n.children) { if (c.localName === 'tbl') html.push(tbl(c)); else if (c.localName !== 't') r(c); } })(ch);
-      } else walk(ch);
-    }
-  }
-  function tbl(t) {
-    const rows = [...t.children].filter((c) => c.localName === 'tr');
-    return `<table>${rows.map((tr) => `<tr>${[...tr.children].filter((c) => c.localName === 'tc').map((tc) => {
-      const span = [...tc.children].find((c) => c.localName === 'cellSpan');
-      const cs = span ? span.getAttribute('colSpan') : 1; const rs = span ? span.getAttribute('rowSpan') : 1;
-      const ps = [...tc.getElementsByTagNameNS('*', 'p')].map(pText).filter((x) => x.trim());
-      text.push(ps.join(' '));
-      return `<td colspan="${cs}" rowspan="${rs}">${ps.map(esc).join('<br>')}</td>`;
-    }).join('')}</tr>`).join('')}</table>`;
-  }
-}
 async function parsePptx(blob) {
   await loadLib('JSZip');
   const zip = await JSZip.loadAsync(blob);
@@ -2155,21 +2417,26 @@ async function renderViewer(box, doc, ver, modal, editable) {
       box.innerHTML = `<div class="docx">${r.value || '<p>(내용 없음)</p>'}</div>`; return;
     }
     if (ext === 'hwpx') {
-      const r = await parseHwpx(blob);
-      box.innerHTML = `<div style="padding:10px 14px 0"><span class="tag blue">HWPX 구조화 미리보기 — 원본 서식은 한글 프로그램에서 확인하세요</span></div><div class="docx">${r.html || '<p>(텍스트 없음)</p>'}</div>`; return;
+      const r = await parseHwpxDoc(blob);
+      box.innerHTML = `<div style="padding:10px 14px 0"><span class="tag blue">한글(HWPX) 미리보기 — 글자·표 내용 중심, 원본 서식은 내려받아 확인</span></div><div class="docx">${r.html || '<p>(텍스트 없음)</p>'}</div>`; return;
     }
     if (ext === 'pptx') {
       const slides = await parsePptx(blob);
       box.innerHTML = slides.map((s, i) => `<div class="slide"><h5>슬라이드 ${i + 1}</h5>${s.map((p, j) => j === 0 ? `<b style="font-size:17px;display:block;margin-bottom:6px">${esc(p)}</b>` : `<div>${esc(p)}</div>`).join('')}</div>`).join('') || '<div class="empty">텍스트가 없는 프레젠테이션입니다.</div>'; return;
     }
     if (ext === 'hwp') {
-      const r = await parseHwp(blob);
-      if (r.img) viewerCleanup.push(r.img);
-      box.innerHTML = `<div style="padding:10px 14px 0"><span class="tag blue">HWP 원본 보존 + 웹 미리보기 (문서에 저장된 미리보기 정보)</span></div>
-        ${r.img ? `<img src="${r.img}" alt="첫 페이지 미리보기" style="padding:16px;max-width:560px;background:#fff">` : ''}
-        ${r.text ? `<pre>${esc(r.text)}</pre>` : ''}${!r.img && !r.text ? `<div class="notice-box">${fileIcon('hwp')}<p>이 HWP 파일에는 미리보기 정보가 없습니다.<br>내려받아 한글 프로그램에서 열어 주세요.</p>${dlBtn(doc, ver)}</div>` : ''}`; return;
+      try {
+        const r = await parseHwpDoc(blob);
+        box.innerHTML = `<div style="padding:10px 14px 0"><span class="tag blue">한글(HWP) 미리보기 — 글자·표 내용 중심, 원본 서식은 내려받아 확인</span></div><div class="docx">${r.html || '<p>(텍스트 없음)</p>'}</div>`; return;
+      } catch (err) {
+        const r = await parseHwp(blob);
+        if (r.img) viewerCleanup.push(r.img);
+        box.innerHTML = `<div style="padding:10px 14px 0"><span class="tag orange">${esc(err.message)} — 문서에 저장된 미리보기 정보만 표시합니다</span></div>
+          ${r.img ? `<img src="${r.img}" alt="첫 페이지 미리보기" style="padding:16px;max-width:560px;background:#fff">` : ''}
+          ${r.text ? `<pre>${esc(r.text)}</pre>` : ''}${!r.img && !r.text ? `<div class="notice-box">${fileIcon('hwp')}<p>미리보기 정보가 없습니다. 내려받아 한글 프로그램에서 열어 주세요.</p>${dlBtn(doc, ver)}</div>` : ''}`; return;
+      }
     }
-    box.innerHTML = `<div class="notice-box">${fileIcon(ext)}<p><b>${esc(ver.name)}</b><br>이 형식(${esc(ext.toUpperCase())})은 브라우저 미리보기를 지원하지 않습니다.<br>원본은 안전하게 보존되어 있으니 내려받아 확인하세요.<br><span style="font-size:12px">💡 PDF 또는 ${ext === 'doc' ? 'DOCX' : ext === 'ppt' ? 'PPTX' : 'HWPX'} 형식으로 함께 올리면 바로 미리보기할 수 있습니다.</span></p>${dlBtn(doc, ver)}</div>`;
+    box.innerHTML = `<div class="notice-box">${fileIcon(ext)}<p><b>${esc(ver.name)}</b><br>이 형식(${esc(ext.toUpperCase())})은 브라우저 미리보기를 지원하지 않습니다.<br>원본은 안전하게 보존되어 있으니 내려받아 확인하세요.<br><span style="font-size:12px">💡 PDF 또는 ${ext === 'doc' ? 'DOCX' : ext === 'ppt' ? 'PPTX' : 'PDF'} 형식으로 함께 올리면 바로 미리보기할 수 있습니다.</span></p>${dlBtn(doc, ver)}</div>`;
   } catch (e) {
     box.innerHTML = `<div class="notice-box">${fileIcon(ext)}<p>미리보기를 만들지 못했습니다.<br><span style="font-size:12px">${esc(e.message)}</span></p>${dlBtn(doc, ver)}</div>`;
   }
@@ -2523,7 +2790,7 @@ VIEWS.meals = (v, args) => {
   const seg = [['today', '오늘'], ['week', '이번 주'], ['month', '이번 달']];
   v.innerHTML = `
     <div class="page-head"><div><div class="eyebrow">급식 식단표</div><h1>급식</h1></div>
-      <div class="actions">${mg ? `<button class="btn secondary" data-act="mealTemplate">${icon('table', 'width="16" height="16"')}양식</button><button class="btn secondary" data-act="mealImport">${icon('upload', 'width="16" height="16"')}식단표 엑셀 불러오기</button><button class="btn" data-act="editMeal" data-date="${ymd(base)}">${icon('edit', 'width="16" height="16"')}식단 입력</button>` : ''}</div></div>
+      <div class="actions">${mg ? `<button class="btn secondary" data-act="mealTemplate">${icon('table', 'width="16" height="16"')}양식</button><button class="btn secondary" data-act="mealImport">${icon('upload', 'width="16" height="16"')}식단표 불러오기 (한글·엑셀)</button><button class="btn" data-act="editMeal" data-date="${ymd(base)}">${icon('edit', 'width="16" height="16"')}식단 입력</button>` : ''}</div></div>
     <div class="cal-toolbar">
       <div class="segmented">${seg.map(([m, l]) => `<button class="${m === mode ? 'active' : ''}" data-act="go" data-to="#meals/${m}/${ts}">${l}</button>`).join('')}</div>
       <div class="cal-nav"><button class="icon-btn" data-act="go" data-to="#meals/${mode}/${ymd(prev)}">${icon('chevL')}</button><button class="icon-btn" data-act="go" data-to="#meals/${mode}/${ymd(next)}">${icon('chevR')}</button></div>
@@ -2560,38 +2827,166 @@ ACT.mealTemplate = async () => {
   ws['!cols'] = [{ wch: 8 }, { wch: 50 }, { wch: 8 }, { wch: 30 }, { wch: 20 }];
   const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, '식단표'); XLSX.writeFile(wb, '급식_식단표_양식.xlsx');
 };
+/* ---------- 식단표 해석: 엑셀·한글(HWP/HWPX) · 목록형/달력형 자동 인식 ---------- */
+const MEAL_SKIP = /^(조식|중식|석식|간식|점심|아침|저녁|메뉴|식단|급식|식단표|날짜|요일)$|원산지|알레르기|알러지|영양|단백질|탄수화물|지방|칼슘|철분|비타민|^[\d.,\s]+$|^[-–·*※~]+$/i;
+const DATE_HEAD = /^\s*(?:[(\[]?[월화수목금토일][)\]]?\s+)?(?:(20\d{2})\s*[.\-/년]\s*)?(?:(\d{1,2})\s*[.\-/월]\s*)?(\d{1,2})\s*일?\s*(?:[(\[]\s*[월화수목금토일]\s*(?:요일)?\s*[)\]])?\s*(?:[월화수목금토일]요일)?\s*$/;
+
+function normMealItem(s) {
+  s = s.replace(/[★☆◆◇●○■□▶※*#♥♡]/g, '').replace(/\s+/g, ' ').trim();
+  if (!s) return '';
+  let m = /^(.*?)\s*\(\s*((?:\d{1,2}\s*[.,]\s*)*\d{1,2})\s*\.?\s*\)\s*$/.exec(s);   // 된장국(5.6.13)
+  if (!m) m = /^(.*?[^\d\s.])\s*((?:\d{1,2}\.)+\d{0,2})\.?\s*$/.exec(s);             // 된장국 5.6.13.
+  if (m && m[1].trim()) {
+    const a = m[2].replace(/[\s,]/g, '.').split('.').filter((n) => n && +n >= 1 && +n <= 19);
+    return a.length ? `${m[1].trim()}(${a.join('.')})` : m[1].trim();
+  }
+  return s;
+}
+function splitMealLines(text) {
+  const out = { items: [], kcal: '' };
+  String(text || '').replace(/\r/g, '').replace(/<br\s*\/?>/gi, '\n').split(/\n|,(?![^(]*\))|·/).forEach((ln) => {
+    const t = ln.trim(); if (!t) return;
+    const k = /([\d.]+)\s*k?cal/i.exec(t); if (k) { out.kcal = String(Math.round(parseFloat(k[1]))); return; }
+    if (MEAL_SKIP.test(t)) return;
+    const it = normMealItem(t); if (it && it.length <= 25) out.items.push(it);
+  });
+  return out;
+}
+function detectYM(strs) {
+  for (const s of strs) { const m = /(20\d{2})\s*[년.\-/]\s*(\d{1,2})\s*월?/.exec(s || ''); if (m && +m[2] >= 1 && +m[2] <= 12) return { y: +m[1], m: +m[2] }; }
+  for (const s of strs) { const m = /(\d{1,2})\s*월/.exec(s || ''); if (m && +m[1] >= 1 && +m[1] <= 12) return { y: null, m: +m[1] }; }
+  return null;
+}
+function mkYmd(y, mo, d) { const dt = new Date(y, mo - 1, d); return dt.getMonth() === ((mo - 1 + 12) % 12) && dt.getDate() === d ? ymd(dt) : null; }
+
+/* 목록형: 머리글에 날짜 + 식단(메뉴) 열 */
+function parseMealList(grid, raw, ym) {
+  const h = grid.slice(0, 15).findIndex((r) => r.some((c) => /날짜|일자/.test(String(c))) && r.some((c) => /식단|메뉴|중식|음식/.test(String(c))));
+  if (h < 0) return null;
+  const head = grid[h].map((c) => String(c).replace(/\s/g, ''));
+  const col = (re) => head.findIndex((c) => re.test(c));
+  const C = { date: col(/날짜|일자/), menu: col(/식단|메뉴|중식|음식/), kcal: col(/칼로리|열량|kcal/i), origin: col(/원산지/), allergy: col(/알레르기|알러지/), note: col(/비고|공지/) };
+  const rows = [];
+  for (let i = h + 1; i < grid.length; i++) {
+    const r = grid[i]; const rr = (raw && raw[i]) || [];
+    let date = cellToDate(rr[C.date], r[C.date], ym.y);
+    if (!date) { const m = DATE_HEAD.exec(String(r[C.date] || '').split('\n')[0]); if (m) date = mkYmd(+m[1] || ym.y, +m[2] || ym.m, +m[3]); }
+    const parsed = splitMealLines(r[C.menu]);
+    if (!date || !parsed.items.length) continue;
+    rows.push({ date, items: parsed.items, kcal: (C.kcal >= 0 ? String(r[C.kcal]).replace(/[^\d.]/g, '') : '') || parsed.kcal, origin: C.origin >= 0 ? String(r[C.origin] || '') : '', allergyText: C.allergy >= 0 ? String(r[C.allergy] || '') : '', note: C.note >= 0 ? String(r[C.note] || '') : '' });
+  }
+  return rows.length ? rows : null;
+}
+/* 달력형: 칸의 첫 줄이 날짜, 아래 줄(또는 아래 칸)이 메뉴 */
+function parseMealCalendar(grid, ym) {
+  const found = [];
+  const head = (t) => DATE_HEAD.exec(String(t || '').replace(/\r/g, '').split('\n')[0]);
+  for (let r = 0; r < grid.length; r++) {
+    for (let c = 0; c < grid[r].length; c++) {
+      const m = head(grid[r][c]); if (!m) continue;
+      let menu = String(grid[r][c]).replace(/\r/g, '').split('\n').slice(1).join('\n');
+      if (!splitMealLines(menu).items.length) {
+        const parts = [];
+        for (let rr = r + 1; rr < Math.min(grid.length, r + 12); rr++) { const t = grid[rr][c]; if (head(t)) break; if (t) parts.push(t); }
+        menu = parts.join('\n');
+      }
+      const p = splitMealLines(menu);
+      if (p.items.length) found.push({ r, y: m[1] ? +m[1] : null, mo: m[2] ? +m[2] : null, d: +m[3], ...p });
+    }
+  }
+  if (!found.length) return null;
+  // 식단 달력인지 확인: 한 줄에 날짜 칸이 2개 이상이거나 요일 머리글(월~금)이 있는 표만 인정
+  const dateRows = {}; found.forEach((e) => { dateRows[e.r] = (dateRows[e.r] || 0) + 1; });
+  const weekdayHead = grid.some((row) => row.filter((c) => /^\s*[(\[]?[월화수목금][)\]]?(요일)?\s*$/.test(String(c))).length >= 3);
+  if (!weekdayHead && !Object.values(dateRows).some((n) => n >= 2)) return null;
+  // 달력 앞뒤의 지난달·다음달 날짜 보정 (월이 적히지 않은 날짜만)
+  const noMo = found.filter((e) => !e.mo);
+  let off = (noMo.length && noMo[0].d > 20 && noMo.some((e) => e.d <= 7)) ? -1 : 0; let prev = null;
+  return found.map((e) => {
+    if (!e.mo) { if (prev && e.d < prev.d - 15) off++; prev = e; }
+    const base = new Date(e.y || ym.y, (e.mo || ym.m) - 1 + (e.mo ? 0 : off), 1);
+    const date = mkYmd(base.getFullYear(), base.getMonth() + 1, e.d);
+    return date ? { date, items: e.items, kcal: e.kcal, origin: '', allergyText: '', note: '' } : null;
+  }).filter(Boolean);
+}
+async function readMealSource(file) {
+  const ext = extOf(file.name);
+  if (ext === 'hwp' || ext === 'hwpx') {
+    const d = ext === 'hwp' ? await parseHwpDoc(file) : await parseHwpxDoc(file);
+    return { grids: d.tables.map((g) => ({ grid: g, raw: null })), texts: [file.name, ...d.paras, ...d.tables.flat(2)] };
+  }
+  await loadLib('XLSX');
+  const wb = ext === 'csv' ? XLSX.read(await file.text(), { type: 'string', raw: true }) : XLSX.read(await file.arrayBuffer(), { type: 'array' });
+  const grids = wb.SheetNames.map((n) => ({
+    grid: XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: false, defval: '' }).map((r) => r.map((x) => String(x).replace(/\r/g, ''))),
+    raw: XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: '' }),
+  }));
+  return { grids, texts: [file.name, ...grids.flatMap((g) => g.grid.slice(0, 6).flat())] };
+}
+function parseMealSource(src, ym) {
+  for (const g of src.grids) { const r = parseMealList(g.grid, g.raw, ym); if (r) return { kind: '목록형', rows: r }; }
+  const all = new Map();
+  for (const g of src.grids) (parseMealCalendar(g.grid, ym) || []).forEach((x) => { const e = all.get(x.date); if (!e || x.items.length > e.items.length) all.set(x.date, x); });
+  if (all.size) return { kind: '달력형', rows: [...all.values()].sort((a, b) => a.date.localeCompare(b.date)) };
+  return null;
+}
+
 ACT.mealImport = () => {
   const m = openModal({
     title: '식단표 불러오기', wide: true,
-    body: `<label class="dropzone" id="mlDrop">${icon('upload')}<div><b>식단표 엑셀(XLSX·XLS·CSV)</b>을 선택하세요</div><div style="font-size:12px;color:var(--text-3);margin-top:4px">열: 날짜 | 식단(메뉴) | 칼로리 | 원산지 | 알레르기 | 비고 — 메뉴는 줄바꿈 또는 쉼표로 구분</div><input type="file" accept=".xlsx,.xls,.csv" hidden></label><div id="mlPrev"></div>`,
-    foot: `<button class="btn secondary" data-act="closeModal">취소</button><button class="btn" id="mlGo" disabled>날짜별 데이터로 변환</button>`,
+    body: `<label class="dropzone" id="mlDrop">${icon('upload')}<div><b>식단표 파일 (한글 HWP·HWPX / 엑셀 XLSX·XLS·CSV)</b>을 끌어오거나 클릭하여 선택</div>
+      <div style="font-size:12px;color:var(--text-3);margin-top:4px">달력형(칸마다 날짜+메뉴)·목록형(날짜 | 식단 열) 모두 자동 인식 · 알레르기 번호·kcal 자동 정리</div><input type="file" accept=".xlsx,.xls,.csv,.hwp,.hwpx" hidden></label>
+      <div id="mlPrev"></div>`,
+    foot: `<div class="left"><label class="check"><input type="checkbox" id="mlKeep" checked> 원본 파일을 자료실(급식)에 보존</label></div>
+      <button class="btn secondary" data-act="closeModal">취소</button><button class="btn" id="mlGo" disabled>날짜별 식단으로 반영</button>`,
   });
-  let rows = [];
-  $('input', m).addEventListener('change', async (e) => {
-    const file = e.target.files[0]; if (!file) return;
+  let src = null; let file = null; let res = null; let ym = null;
+  const T = today();
+  const render = () => {
+    res = parseMealSource(src, ym);
+    const box = $('#mlPrev', m);
+    if (!res) { box.innerHTML = `<div class="empty" style="color:var(--red);text-align:left;padding:16px 4px">식단을 찾지 못했습니다.<br><span style="font-size:13px;color:var(--text-2)">· 달력형: 칸의 첫 줄에 날짜(예: 1, 1(월), 10.1), 그 아래에 메뉴<br>· 목록형: 첫 줄에 「날짜」「식단」 제목이 있는 표<br>양식이 다르면 「양식」 버튼의 엑셀 양식을 사용해 주세요.</span></div>`; $('#mlGo', m).disabled = true; return; }
+    const years = [T.getFullYear() - 1, T.getFullYear(), T.getFullYear() + 1];
+    box.innerHTML = `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:14px 0 10px">
+        <span class="tag blue">${res.kind}</span><b>${res.rows.length}일치 식단 인식</b>
+        ${res.kind === '달력형' ? `<span style="margin-left:auto;font-size:13px;color:var(--text-2)">식단 연·월</span>
+          <select class="input" id="mlY" style="width:auto;padding:6px 10px">${years.map((y) => `<option ${y === ym.y ? 'selected' : ''}>${y}</option>`).join('')}</select>
+          <select class="input" id="mlM" style="width:auto;padding:6px 10px">${Array.from({ length: 12 }, (_, i) => `<option value="${i + 1}" ${i + 1 === ym.m ? 'selected' : ''}>${i + 1}월</option>`).join('')}</select>` : ''}
+      </div>
+      <div class="table-wrap" style="max-height:46vh;overflow:auto"><table class="tbl"><thead><tr><th></th><th>날짜</th><th>식단</th><th>kcal</th><th>상태</th></tr></thead><tbody>
+      ${res.rows.map((r, i) => `<tr><td><input type="checkbox" data-i="${i}" checked></td><td class="num">${fmtMD(r.date)}</td><td>${r.items.map((x) => { const it = mealItem(x); return esc(it.n) + (it.a ? `<sup style="color:var(--text-3)">${esc(it.a)}</sup>` : ''); }).join(', ')}</td><td>${esc(r.kcal)}</td>
+        <td>${DB.meals[r.date] ? '<span class="tag orange">덮어씀</span>' : '<span class="tag green">새로</span>'}</td></tr>`).join('')}</tbody></table></div>`;
+    $$('input[data-i]', box).forEach((c) => c.addEventListener('change', () => { res.rows[c.dataset.i].off = !c.checked; }));
+    const yS = $('#mlY', box); const mS = $('#mlM', box);
+    if (yS) [yS, mS].forEach((s) => s.addEventListener('change', () => { ym = { y: +yS.value, m: +mS.value }; render(); }));
+    $('#mlGo', m).disabled = !res.rows.length;
+  };
+  const handle = async (f) => {
+    if (!f) return;
+    file = f; $('#mlPrev', m).innerHTML = '<div class="empty">파일을 읽는 중…</div>';
     try {
-      const { raw, txt } = await readSheetRows(file);
-      let h = txt.findIndex((r) => r.some((c) => /날짜|일자/.test(String(c))));
-      if (h < 0) throw new Error('「날짜」 열을 찾지 못했습니다.');
-      const head = txt[h].map((c) => String(c).replace(/\s/g, ''));
-      const col = (re) => head.findIndex((c) => re.test(c));
-      const C = { date: col(/날짜|일자/), menu: col(/식단|메뉴|중식|음식/), kcal: col(/칼로리|열량|kcal/i), origin: col(/원산지/), allergy: col(/알레르기|알러지/), note: col(/비고|공지/) };
-      if (C.menu < 0) throw new Error('「식단」(또는 메뉴) 열을 찾지 못했습니다.');
-      rows = [];
-      for (let i = h + 1; i < txt.length; i++) {
-        const date = cellToDate((raw[i] || [])[C.date], txt[i][C.date]);
-        const items = String(txt[i][C.menu] || '').replace(/<br\s*\/?>/gi, '\n').split(/\n|,|·/).map((s) => s.trim()).filter(Boolean);
-        if (!date || !items.length) continue;
-        rows.push({ date, items, kcal: C.kcal >= 0 ? String(txt[i][C.kcal]).replace(/[^\d.]/g, '') : '', origin: C.origin >= 0 ? String(txt[i][C.origin]) : '', allergyText: C.allergy >= 0 ? String(txt[i][C.allergy]) : '', note: C.note >= 0 ? String(txt[i][C.note]) : '' });
-      }
-      $('#mlPrev', m).innerHTML = `<p style="margin:14px 0 8px">${rows.length}일치 식단 인식 · 기존 식단은 덮어씁니다.</p><div class="table-wrap"><table class="tbl"><thead><tr><th>날짜</th><th>식단</th><th>칼로리</th></tr></thead><tbody>${rows.map((r) => `<tr><td class="num">${fmtMD(r.date)}${DB.meals[r.date] ? ' <span class="tag orange">덮어씀</span>' : ''}</td><td>${r.items.map(esc).join(', ')}</td><td>${esc(r.kcal)}</td></tr>`).join('')}</tbody></table></div>`;
-      $('#mlGo', m).disabled = !rows.length;
+      src = await readMealSource(f);
+      const d = detectYM(src.texts);
+      const def = T.getDate() > 20 ? addMonths(T, 1) : T;
+      ym = { y: (d && d.y) || (d && d.m < def.getMonth() + 1 - 6 ? def.getFullYear() + 1 : def.getFullYear()), m: (d && d.m) || def.getMonth() + 1 };
+      render();
     } catch (err) { $('#mlPrev', m).innerHTML = `<div class="empty" style="color:var(--red)">${esc(err.message)}</div>`; }
-  });
-  $('#mlGo', m).addEventListener('click', () => {
-    rows.forEach((r) => { DB.meals[r.date] = { items: r.items, kcal: r.kcal, origin: r.origin, allergyText: r.allergyText, note: r.note, updatedBy: ME.id, updatedAt: nowISO() }; });
-    log('import', 'meal', `식단 ${rows.length}일`); notify(`새 급식 식단표가 등록되었습니다. (${rows.length}일)`, 'meal', '#meals/week/' + rows[0].date);
-    saveDB(); closeModal(); toast(`${rows.length}일치 식단이 반영되었습니다.`); location.hash = '#meals/week/' + rows[0].date;
+  };
+  const drop = $('#mlDrop', m); const input = $('input', drop);
+  input.addEventListener('change', () => handle(input.files[0]));
+  drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('drag'); });
+  drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
+  drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('drag'); handle(e.dataTransfer.files[0]); });
+  $('#mlGo', m).addEventListener('click', async () => {
+    const rows = res.rows.filter((r) => !r.off);
+    if (!rows.length) return toast('반영할 날짜를 선택하세요.');
+    $('#mlGo', m).disabled = true;
+    const lastOrigin = DB.meals[Object.keys(DB.meals).sort().pop()]?.origin || '';
+    rows.forEach((r) => { DB.meals[r.date] = { items: r.items, kcal: r.kcal, origin: r.origin || (DB.meals[r.date] && DB.meals[r.date].origin) || lastOrigin, allergyText: r.allergyText, note: r.note, updatedBy: ME.id, updatedAt: nowISO() }; });
+    if ($('#mlKeep', m).checked) { try { await createDoc(file, { title: file.name.replace(/\.[^.]+$/, ''), category: '급식', dept: ME.dept, note: `식단 ${rows.length}일 반영` }, true); } catch (e) { toast('원본 보존 실패: ' + e.message); } }
+    log('import', 'meal', `식단 ${rows.length}일`, file.name);
+    notify(`새 급식 식단표가 등록되었습니다. (${fmtMD(rows[0].date)}~${fmtMD(rows[rows.length - 1].date)}, ${rows.length}일)`, 'meal', '#meals/month/' + rows[0].date);
+    saveDB(); closeModal(); toast(`${rows.length}일치 식단이 반영되었습니다.`); location.hash = '#meals/month/' + rows[0].date;
   });
 };
 
@@ -2720,7 +3115,7 @@ VIEWS.admin = (v, args) => {
     <div id="adminBody"></div>`;
   ADMIN[tab]($('#adminBody'));
 };
-const ACT_LABEL = { login: '로그인', logout: '로그아웃', view: '열람', download: '다운로드', create: '등록', update: '수정', delete: '삭제', restore: '복구', import: '불러오기', register: '가입 신청', approve: '승인', unlock: '잠금 해제', 'admin-auth': '관리자 인증', 'admin-auth-fail': '관리자 인증 실패', backup: '백업', settings: '설정 변경' };
+const ACT_LABEL = { login: '로그인', logout: '로그아웃', view: '열람', download: '다운로드', create: '등록', update: '수정', delete: '삭제', restore: '복구', import: '불러오기', register: '가입 신청', approve: '승인', unlock: '잠금 해제', 'admin-auth': '관리자 인증', 'admin-auth-fail': '관리자 인증 실패', backup: '백업', settings: '설정 변경', print: '인쇄' };
 const TYPE_LABEL = { doc: '자료', event: '일정', meeting: '회의', notice: '공지', meal: '급식', plan: '업무계획', user: '교직원', session: '세션', dept: '부서', system: '시스템' };
 function logLine(l) { return `<div class="log-line"><time>${fmtFull(l.t).slice(5)}</time><div style="flex:1;min-width:0"><b>${esc(user(l.uid).name)}</b> · ${ACT_LABEL[l.act] || esc(l.act)} <span class="tag">${TYPE_LABEL[l.type] || esc(l.type)}</span> ${esc(l.title)} ${l.extra ? `<span style="color:var(--text-3)">(${esc(l.extra)})</span>` : ''}</div></div>`; }
 const ADMIN = {};

@@ -18,46 +18,13 @@ async function extractText(blob, name) {
       return wb.SheetNames.map((n) => XLSX.utils.sheet_to_csv(wb.Sheets[n])).join('\n').slice(0, 30000);
     }
     if (ext === 'docx') { await loadLib('mammoth'); const r = await mammoth.extractRawText({ arrayBuffer: await blob.arrayBuffer() }); return r.value.slice(0, 30000); }
-    if (ext === 'hwpx') { const r = await parseHwpx(blob); return r.text.slice(0, 30000); }
+    if (ext === 'hwpx') { const r = await parseHwpxDoc(blob); return r.text.slice(0, 30000); }
     if (ext === 'pptx') { const s = await parsePptx(blob); return s.map((x) => x.join('\n')).join('\n').slice(0, 30000); }
-    if (ext === 'hwp') { const r = await parseHwp(blob); return (r.text || '').slice(0, 30000); }
+    if (ext === 'hwp') { try { const r = await parseHwpDoc(blob); return r.text.slice(0, 30000); } catch (e) { const r = await parseHwp(blob); return (r.text || '').slice(0, 30000); } }
   } catch (e) { console.warn('텍스트 추출 실패', name, e); }
   return '';
 }
 
-/* HWPX: ZIP + XML (OWPML) → 문단·표 구조 추출 */
-async function parseHwpx(blob) {
-  await loadLib('JSZip');
-  const zip = await JSZip.loadAsync(blob);
-  const secs = Object.keys(zip.files).filter((f) => /Contents\/section\d+\.xml$/i.test(f)).sort((a, b) => parseInt(a.match(/(\d+)\.xml/)[1], 10) - parseInt(b.match(/(\d+)\.xml/)[1], 10));
-  const html = []; const text = [];
-  for (const f of secs) {
-    const xml = new DOMParser().parseFromString(await zip.file(f).async('string'), 'application/xml');
-    walk(xml.documentElement);
-  }
-  return { html: html.join(''), text: text.join('\n') };
-
-  function pText(p) { let s = ''; (function r(n) { for (const c of n.children) { if (c.localName === 'tbl') continue; if (c.localName === 't') s += c.textContent; else if (c.localName === 'tab') s += '\t'; else r(c); } })(p); return s; }
-  function walk(node) {
-    for (const ch of node.children) {
-      if (ch.localName === 'tbl') html.push(tbl(ch));
-      else if (ch.localName === 'p') {
-        const t = pText(ch); if (t.trim()) { html.push(`<p>${esc(t)}</p>`); text.push(t); } else html.push('<p>&nbsp;</p>');
-        (function r(n) { for (const c of n.children) { if (c.localName === 'tbl') html.push(tbl(c)); else if (c.localName !== 't') r(c); } })(ch);
-      } else walk(ch);
-    }
-  }
-  function tbl(t) {
-    const rows = [...t.children].filter((c) => c.localName === 'tr');
-    return `<table>${rows.map((tr) => `<tr>${[...tr.children].filter((c) => c.localName === 'tc').map((tc) => {
-      const span = [...tc.children].find((c) => c.localName === 'cellSpan');
-      const cs = span ? span.getAttribute('colSpan') : 1; const rs = span ? span.getAttribute('rowSpan') : 1;
-      const ps = [...tc.getElementsByTagNameNS('*', 'p')].map(pText).filter((x) => x.trim());
-      text.push(ps.join(' '));
-      return `<td colspan="${cs}" rowspan="${rs}">${ps.map(esc).join('<br>')}</td>`;
-    }).join('')}</tr>`).join('')}</table>`;
-  }
-}
 async function parsePptx(blob) {
   await loadLib('JSZip');
   const zip = await JSZip.loadAsync(blob);
@@ -261,21 +228,26 @@ async function renderViewer(box, doc, ver, modal, editable) {
       box.innerHTML = `<div class="docx">${r.value || '<p>(내용 없음)</p>'}</div>`; return;
     }
     if (ext === 'hwpx') {
-      const r = await parseHwpx(blob);
-      box.innerHTML = `<div style="padding:10px 14px 0"><span class="tag blue">HWPX 구조화 미리보기 — 원본 서식은 한글 프로그램에서 확인하세요</span></div><div class="docx">${r.html || '<p>(텍스트 없음)</p>'}</div>`; return;
+      const r = await parseHwpxDoc(blob);
+      box.innerHTML = `<div style="padding:10px 14px 0"><span class="tag blue">한글(HWPX) 미리보기 — 글자·표 내용 중심, 원본 서식은 내려받아 확인</span></div><div class="docx">${r.html || '<p>(텍스트 없음)</p>'}</div>`; return;
     }
     if (ext === 'pptx') {
       const slides = await parsePptx(blob);
       box.innerHTML = slides.map((s, i) => `<div class="slide"><h5>슬라이드 ${i + 1}</h5>${s.map((p, j) => j === 0 ? `<b style="font-size:17px;display:block;margin-bottom:6px">${esc(p)}</b>` : `<div>${esc(p)}</div>`).join('')}</div>`).join('') || '<div class="empty">텍스트가 없는 프레젠테이션입니다.</div>'; return;
     }
     if (ext === 'hwp') {
-      const r = await parseHwp(blob);
-      if (r.img) viewerCleanup.push(r.img);
-      box.innerHTML = `<div style="padding:10px 14px 0"><span class="tag blue">HWP 원본 보존 + 웹 미리보기 (문서에 저장된 미리보기 정보)</span></div>
-        ${r.img ? `<img src="${r.img}" alt="첫 페이지 미리보기" style="padding:16px;max-width:560px;background:#fff">` : ''}
-        ${r.text ? `<pre>${esc(r.text)}</pre>` : ''}${!r.img && !r.text ? `<div class="notice-box">${fileIcon('hwp')}<p>이 HWP 파일에는 미리보기 정보가 없습니다.<br>내려받아 한글 프로그램에서 열어 주세요.</p>${dlBtn(doc, ver)}</div>` : ''}`; return;
+      try {
+        const r = await parseHwpDoc(blob);
+        box.innerHTML = `<div style="padding:10px 14px 0"><span class="tag blue">한글(HWP) 미리보기 — 글자·표 내용 중심, 원본 서식은 내려받아 확인</span></div><div class="docx">${r.html || '<p>(텍스트 없음)</p>'}</div>`; return;
+      } catch (err) {
+        const r = await parseHwp(blob);
+        if (r.img) viewerCleanup.push(r.img);
+        box.innerHTML = `<div style="padding:10px 14px 0"><span class="tag orange">${esc(err.message)} — 문서에 저장된 미리보기 정보만 표시합니다</span></div>
+          ${r.img ? `<img src="${r.img}" alt="첫 페이지 미리보기" style="padding:16px;max-width:560px;background:#fff">` : ''}
+          ${r.text ? `<pre>${esc(r.text)}</pre>` : ''}${!r.img && !r.text ? `<div class="notice-box">${fileIcon('hwp')}<p>미리보기 정보가 없습니다. 내려받아 한글 프로그램에서 열어 주세요.</p>${dlBtn(doc, ver)}</div>` : ''}`; return;
+      }
     }
-    box.innerHTML = `<div class="notice-box">${fileIcon(ext)}<p><b>${esc(ver.name)}</b><br>이 형식(${esc(ext.toUpperCase())})은 브라우저 미리보기를 지원하지 않습니다.<br>원본은 안전하게 보존되어 있으니 내려받아 확인하세요.<br><span style="font-size:12px">💡 PDF 또는 ${ext === 'doc' ? 'DOCX' : ext === 'ppt' ? 'PPTX' : 'HWPX'} 형식으로 함께 올리면 바로 미리보기할 수 있습니다.</span></p>${dlBtn(doc, ver)}</div>`;
+    box.innerHTML = `<div class="notice-box">${fileIcon(ext)}<p><b>${esc(ver.name)}</b><br>이 형식(${esc(ext.toUpperCase())})은 브라우저 미리보기를 지원하지 않습니다.<br>원본은 안전하게 보존되어 있으니 내려받아 확인하세요.<br><span style="font-size:12px">💡 PDF 또는 ${ext === 'doc' ? 'DOCX' : ext === 'ppt' ? 'PPTX' : 'PDF'} 형식으로 함께 올리면 바로 미리보기할 수 있습니다.</span></p>${dlBtn(doc, ver)}</div>`;
   } catch (e) {
     box.innerHTML = `<div class="notice-box">${fileIcon(ext)}<p>미리보기를 만들지 못했습니다.<br><span style="font-size:12px">${esc(e.message)}</span></p>${dlBtn(doc, ver)}</div>`;
   }
