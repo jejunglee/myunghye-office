@@ -150,7 +150,7 @@ VIEWS.calendar = (v, args) => {
   const seg = [['today', '오늘'], ['day', '일'], ['week', '주'], ['month', '월'], ['year', '연']];
   v.innerHTML = `
     <div class="page-head"><div><div class="eyebrow">통합 일정</div><h1>일정</h1></div>
-      <div class="actions"><button class="btn" data-act="newEvent" data-date="${ymd(base)}">${icon('plus', 'width="16" height="16"')}일정 추가</button></div></div>
+      <div class="actions"><button class="btn secondary" data-act="planImport" data-kind="">${icon('upload', 'width="16" height="16"')}일정 불러오기 (한글·엑셀)</button><button class="btn" data-act="newEvent" data-date="${ymd(base)}">${icon('plus', 'width="16" height="16"')}일정 추가</button></div></div>
     <div class="cal-toolbar">
       <div class="segmented">${seg.map(([m, l]) => `<button class="${m === mode ? 'active' : ''}" data-act="go" data-to="#calendar/${m === 'today' ? 'day' : m}/${m === 'today' ? ts : ymd(base)}">${l}</button>`).join('')}</div>
       <div class="cal-nav"><button class="icon-btn" data-act="go" data-to="#calendar/${mode}/${ymd(prev)}" aria-label="이전">${icon('chevL')}</button><button class="icon-btn" data-act="go" data-to="#calendar/${mode}/${ymd(next)}" aria-label="다음">${icon('chevR')}</button></div>
@@ -255,7 +255,7 @@ function planView(v, type, arg) {
         <button class="btn secondary" data-act="planTemplate">${icon('table', 'width="16" height="16"')}양식</button>
         <button class="btn secondary" data-act="planOutput" data-from="${from}" data-to="${to}" data-type="${type}">🖨 A4 인쇄</button>
         <button class="btn secondary" data-act="planOutput" data-from="${from}" data-to="${to}" data-type="${type}">${icon('download', 'width="16" height="16"')}엑셀 저장</button>
-        <button class="btn secondary" data-act="planImport" data-kind="${kindName}">${icon('upload', 'width="16" height="16"')}엑셀 불러오기</button>
+        <button class="btn secondary" data-act="planImport" data-kind="${kindName}">${icon('upload', 'width="16" height="16"')}일정 불러오기 (한글·엑셀)</button>
         <button class="btn" data-act="planAddRow" data-date="${type === 'week' ? ymd(mondayOf(base)) : from}" data-kind="${kindName}">${icon('plus', 'width="16" height="16"')}행 추가</button>
       </div></div>
     <div class="cal-toolbar">
@@ -388,86 +388,195 @@ function matchDept(s) {
   return d ? d.id : '';
 }
 
-/* ---------- 엑셀 불러오기 → 미리보기 → 일정 변환 ---------- */
-async function readSheetRows(file) {
-  await loadLib('XLSX');
-  const ext = extOf(file.name);
-  let wb;
-  if (ext === 'csv' || ext === 'txt') {
-    let text = await file.text();
-    wb = XLSX.read(text, { type: 'string', raw: true });
-  } else {
-    wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
-  }
-  const ws = wb.Sheets[wb.SheetNames[0]];
-  return {
-    raw: XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: '' }),
-    txt: XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' }),
-  };
+/* ---------- 일정 파일 불러오기: 엑셀·한글 · 목록형 / 날짜별 행 / 달력형 / 문단 자동 인식 ---------- */
+const PLACE_HINT = /(실|강당|관|교실|운동장|도서관|체육관|센터|청|홀|장|방|카페|박물관|미술관|공원|교육청|학교|온라인|원격|줌|zoom|본관|별관|동)$/i;
+const PLAN_SKIP = /^(시간|업무|업무\s*내용|내용|행사|행사\s*내용|장소|담당|담당부서|담당자|비고|요일|날짜|일자|일정|주요\s*업무|구분|[월화수목금토일](요일)?)$/;
+function deptOf(s) {
+  s = String(s || '').replace(/\s/g, '');
+  if (s.length < 2) return '';
+  const exact = DB.depts.find((d) => d.name === s || d.name.replace(/부$/, '') === s);
+  if (exact) return exact.id;
+  const pre = DB.depts.filter((d) => d.name.startsWith(s));
+  return pre.length === 1 ? pre[0].id : '';
 }
-function mapPlanRows(raw, txt) {
-  let h = -1;
-  for (let i = 0; i < Math.min(15, txt.length); i++) { if (txt[i].some((c) => /날짜|일자|일시/.test(String(c)))) { h = i; break; } }
-  if (h < 0) throw new Error('「날짜」 열을 찾지 못했습니다. 첫 행에 날짜·시간·업무·장소·담당 제목을 넣어 주세요.');
-  const head = txt[h].map((c) => String(c).replace(/\s/g, ''));
-  const col = (re, not) => head.findIndex((c) => re.test(c) && !(not && not.test(c)));
-  const C = { date: col(/날짜|일자|일시/), time: col(/시간|시각/), title: col(/업무|내용|행사|일정|제목|활동/, /장소|부서|담당/), place: col(/장소/), dept: col(/담당부서|부서|주관|담당/, /담당자/), manager: col(/담당자/) };
-  if (C.title < 0) throw new Error('「업무」(또는 내용·행사) 열을 찾지 못했습니다.');
-  const out = []; let lastDate = '';
-  for (let i = h + 1; i < txt.length; i++) {
-    const r = txt[i]; const rr = raw[i] || [];
-    const title = String(r[C.title] || '').trim();
-    let date = C.date >= 0 ? cellToDate(rr[C.date], r[C.date]) : '';
-    if (date) lastDate = date; else date = lastDate; // 병합셀 대응
-    if (!title) continue;
-    const t = C.time >= 0 ? cellToTime(rr[C.time], r[C.time]) : { start: '', end: '' };
-    const deptTxt = C.dept >= 0 ? String(r[C.dept] || '') : '';
-    out.push({ date, start: t.start, end: t.end, title, place: C.place >= 0 ? String(r[C.place] || '').trim() : '', dept: matchDept(deptTxt) || ME.dept, deptTxt, manager: C.manager >= 0 ? String(r[C.manager] || '').trim() : '' });
+function yearFor(mo, ym) { return mo < ym.m - 6 ? ym.y + 1 : mo > ym.m + 6 ? ym.y - 1 : ym.y; }
+function headDate(m, ym) { const mo = m[2] ? +m[2] : ym.m; return mkYmd(m[1] ? +m[1] : yearFor(mo, ym), mo, +m[3]); }
+
+/* 일정 한 줄 → 시간 · 제목 · 장소 · 부서 */
+function parseEventLine(line) {
+  let s = String(line || '').replace(/\r/g, '').replace(/\s+/g, ' ').trim();
+  s = s.replace(/^[-–·•◦○●◎□■▶▷※*]+\s*/, '').replace(/^\d{1,2}[.)]\s+/, '').trim();
+  if (!s || s.length > 80 || PLAN_SKIP.test(s)) return null;
+  let start = ''; let end = '';
+  const tm = /^(?:(?:오전|오후)\s*)?\d{1,2}\s*[:시]\s*(?:\d{1,2}\s*분?)?(?:\s*[~\-–]\s*(?:(?:오전|오후)\s*)?\d{1,2}\s*(?:[:시]\s*(?:\d{1,2}\s*분?)?)?)?/.exec(s);
+  if (tm && /[:시]/.test(tm[0])) { const t = parseTimeText(tm[0]); start = t.start; end = t.end; s = s.slice(tm[0].length).replace(/^[\s,/)\]\-:]+/, '').trim(); }
+  let place = ''; let dp = '';
+  for (let k = 0; k < 2; k++) {
+    const m = /\s*[(\[<〈]\s*([^()\[\]<>〈〉]{1,20}?)\s*[)\]>〉]\s*$/.exec(s);
+    if (!m) break;
+    const inner = m[1].trim(); const d = deptOf(inner);
+    if (d && !dp) { dp = d; s = s.slice(0, m.index).trim(); continue; }
+    if (!place && PLACE_HINT.test(inner)) { place = inner; s = s.slice(0, m.index).trim(); continue; }
+    break;
   }
-  return out;
+  if (!place) { const m = /\s*[/@]\s*([^/@]{1,15})$/.exec(s); if (m && PLACE_HINT.test(m[1].trim())) { place = m[1].trim(); s = s.slice(0, m.index).trim(); } }
+  if (!s || /^[\d\s.:~\-()]+$/.test(s)) return null;
+  return { title: s, start, end, place, dept: dp };
+}
+const cellLines = (t) => String(t || '').replace(/\r/g, '').split('\n').map((x) => x.trim()).filter(Boolean);
+
+/* ① 목록형: 머리글에 날짜 + 업무(내용·행사) 열 */
+function planFromList(grid, raw, ym) {
+  const h = grid.slice(0, 15).findIndex((r) => r.some((c) => /날짜|일자|일시/.test(String(c))) && r.some((c) => /업무|내용|행사|일정|제목|활동/.test(String(c))));
+  if (h < 0) return null;
+  const head = grid[h].map((c) => String(c).replace(/\s/g, ''));
+  const col = (re, not) => head.findIndex((c) => re.test(c) && !(not && not.test(c)));
+  const C = { date: col(/날짜|일자|일시/), time: col(/시간|시각/), title: col(/업무|내용|행사|일정|제목|활동/, /장소|부서|담당|날짜|일자/), place: col(/장소/), dept: col(/담당부서|부서|주관|담당/, /담당자/), manager: col(/담당자/) };
+  if (C.title < 0) return null;
+  const out = []; let lastDate = '';
+  for (let i = h + 1; i < grid.length; i++) {
+    const r = grid[i]; const rr = (raw && raw[i]) || [];
+    let date = C.date >= 0 ? cellToDate(rr[C.date], r[C.date], ym.y) : '';
+    if (!date && C.date >= 0) { const m = DATE_HEAD.exec(cellLines(r[C.date])[0] || ''); if (m) date = headDate(m, ym); }
+    if (date) lastDate = date; else date = lastDate;   // 병합 셀
+    const lines = cellLines(r[C.title]); if (!date || !lines.length) continue;
+    const colTime = C.time >= 0 ? cellToTime(rr[C.time], r[C.time]) : { start: '', end: '' };
+    const colDept = C.dept >= 0 ? (matchDept(r[C.dept]) || deptOf(r[C.dept])) : '';
+    lines.forEach((ln) => {
+      const e = parseEventLine(ln); if (!e) return;
+      out.push({ date, start: e.start || (lines.length === 1 ? colTime.start : ''), end: e.end || (lines.length === 1 ? colTime.end : ''), title: e.title,
+        place: e.place || (C.place >= 0 ? String(r[C.place] || '').trim() : ''), dept: e.dept || colDept, manager: C.manager >= 0 ? String(r[C.manager] || '').trim() : '' });
+    });
+  }
+  return out.length ? out : null;
+}
+/* ② 날짜별 행: 한 열에 날짜가 세로로 3개 이상, 같은 행의 다른 칸이 그날 일정 */
+function planFromDateRows(grid, ym) {
+  const W = Math.max(0, ...grid.map((r) => r.length));
+  let dc = -1;
+  for (let c = 0; c < Math.min(3, W); c++) if (grid.filter((r) => DATE_HEAD.test(cellLines(r[c])[0] || '')).length >= 3) { dc = c; break; }
+  if (dc < 0) return null;
+  const out = []; let cur = '';
+  grid.forEach((r) => {
+    const first = cellLines(r[dc]);
+    const m = DATE_HEAD.exec(first[0] || '');
+    if (m) cur = headDate(m, ym);
+    if (!cur) return;
+    const lines = [...(m ? first.slice(1) : first), ...r.flatMap((c, i) => (i === dc ? [] : cellLines(c)))];
+    // 부서 이름만 있는 칸은 일정이 아니라 그 줄 일정의 담당 부서
+    const rowDept = lines.map((ln) => deptOf(ln) || (DB.depts.some((x) => x.name === ln.replace(/\s/g, '')) ? matchDept(ln) : '')).find(Boolean) || '';
+    lines.filter((ln) => !deptOf(ln)).forEach((ln) => { const e = parseEventLine(ln); if (e) out.push({ date: cur, ...e, dept: e.dept || rowDept, manager: '' }); });
+  });
+  return out.length ? out : null;
+}
+/* ③ 달력형: 칸의 첫 줄이 날짜, 아래 줄(또는 아래 칸)이 일정 */
+function planFromCalendar(grid, ym) {
+  const head = (t) => DATE_HEAD.exec(cellLines(t)[0] || '');
+  const found = [];
+  for (let r = 0; r < grid.length; r++) for (let c = 0; c < grid[r].length; c++) {
+    const m = head(grid[r][c]); if (!m) continue;
+    let lines = cellLines(grid[r][c]).slice(1);
+    if (!lines.length) for (let rr = r + 1; rr < Math.min(grid.length, r + 8); rr++) { if (head(grid[rr][c])) break; lines.push(...cellLines(grid[rr][c])); }
+    found.push({ r, m, lines });
+  }
+  const perRow = {}; found.forEach((f) => { perRow[f.r] = (perRow[f.r] || 0) + 1; });
+  const weekdayHead = grid.some((row) => row.filter((c) => /^\s*[(\[]?[월화수목금토일][)\]]?(요일)?\s*$/.test(String(c))).length >= 3);
+  if (!found.length || (!weekdayHead && !Object.values(perRow).some((n) => n >= 2))) return null;
+  const noMo = found.filter((f) => !f.m[2]);
+  let off = (noMo.length && +noMo[0].m[3] > 20 && noMo.some((f) => +f.m[3] <= 7)) ? -1 : 0; let prev = null;
+  const out = [];
+  found.forEach((f) => {
+    let date;
+    if (f.m[2]) date = headDate(f.m, ym);
+    else { if (prev && +f.m[3] < +prev.m[3] - 15) off++; prev = f; const b = new Date(ym.y, ym.m - 1 + off, 1); date = mkYmd(b.getFullYear(), b.getMonth() + 1, +f.m[3]); }
+    if (date) f.lines.forEach((ln) => { const e = parseEventLine(ln); if (e) out.push({ date, ...e, manager: '' }); });
+  });
+  return out.length ? out : null;
+}
+/* ④ 문단: 「9. 22.(월) 14:00 교직원 연수(강당)」처럼 날짜로 시작하는 줄 */
+function planFromParas(paras, ym) {
+  const out = [];
+  const re = /^\s*(?:[-·•○◦▶]\s*)?(?:(20\d{2})\s*[.년]\s*)?(\d{1,2})\s*[./월]\s*(\d{1,2})\s*[.일]?\s*(?:[(\[]\s*[월화수목금토일]\s*[)\]])?\s*[:.\-]?\s+(.+)$/;
+  paras.flatMap(cellLines).forEach((p) => {
+    const m = re.exec(p); if (!m) return;
+    const date = mkYmd(m[1] ? +m[1] : yearFor(+m[2], ym), +m[2], +m[3]); const e = parseEventLine(m[4]);
+    if (date && e) out.push({ date, ...e, manager: '' });
+  });
+  return out.length ? out : null;
+}
+function parsePlanSource(src, ym) {
+  const all = []; const kinds = new Set();
+  src.grids.forEach((g) => {
+    let r = planFromList(g.grid, g.raw, ym); if (r) { kinds.add('목록형 표'); all.push(...r); return; }
+    r = planFromDateRows(g.grid, ym); if (r) { kinds.add('날짜별 행'); all.push(...r); return; }
+    r = planFromCalendar(g.grid, ym); if (r) { kinds.add('달력형'); all.push(...r); }
+  });
+  const p = planFromParas(src.paras || [], ym); if (p) { kinds.add('문단'); all.push(...p); }
+  const seen = new Set();
+  const rows = all.filter((e) => { const k = e.date + '|' + e.start + '|' + e.title; if (seen.has(k)) return false; seen.add(k); return true; })
+    .sort((a, b) => (a.date + (a.start || '99')).localeCompare(b.date + (b.start || '99')));
+  return { rows, kinds: [...kinds] };
 }
 
 ACT.planImport = (d) => {
+  const kinds = ['주중업무', '월중행사', '일반'];
   const m = openModal({
-    title: '엑셀·CSV 불러오기', wide: true,
+    title: '일정 불러오기 (한글·엑셀)', wide: true,
     body: `<div class="flow" style="margin-bottom:14px"><span class="on">① 파일 업로드</span>→<span id="st2">② 내용 확인</span>→<span id="st3">③ 일정 데이터 변환</span>→<span>④ 웹에서 수정</span>→<span>⑤ 일정에 반영</span></div>
-      <label class="dropzone" id="planDrop">${icon('upload')}<div><b>주중·월중업무계획 파일(XLSX, XLS, CSV)</b>을 끌어오거나 클릭하여 선택</div>
-      <div style="font-size:12px;margin-top:4px;color:var(--text-3)">첫 행: 날짜 | 시간 | 업무 | 장소 | 담당 (열 순서·이름은 자동 인식)</div><input type="file" accept=".xlsx,.xls,.csv" hidden></label>
+      <label class="dropzone" id="planDrop">${icon('upload')}<div><b>주중·월중업무계획 파일 (한글 HWP·HWPX / 엑셀 XLSX·XLS·CSV)</b>을 끌어오거나 클릭하여 선택</div>
+      <div style="font-size:12px;margin-top:4px;color:var(--text-3)">목록형 표(날짜 | 시간 | 업무 | 장소 | 담당) · 날짜별 행 · 달력형 · 「9.22(월) 14:00 연수(강당)」 같은 문장 모두 자동 인식</div><input type="file" accept=".xlsx,.xls,.csv,.hwp,.hwpx" hidden></label>
       <div id="planPreview"></div>`,
-    foot: `<div class="left"><select class="input" id="impKind" style="width:auto">${['주중업무', '월중행사'].map((k) => `<option ${k === d.kind ? 'selected' : ''}>${k}</option>`).join('')}</select>
+    foot: `<div class="left"><select class="input" id="impKind" style="width:auto">${kinds.map((k) => `<option ${k === d.kind ? 'selected' : ''}>${k}</option>`).join('')}</select>
       <label class="check"><input type="checkbox" id="impKeep" checked> 원본 파일 자료실에 보존</label></div>
-      <button class="btn secondary" data-act="closeModal">취소</button><button class="btn" id="impGo" disabled>일정으로 변환</button>`,
+      <button class="btn secondary" data-act="closeModal">취소</button><button class="btn" id="impGo" disabled>일정으로 반영</button>`,
   });
-  let rows = []; let srcFile = null;
+  let rows = []; let srcFile = null; let src = null; let ym = null; let kindsFound = [];
   const drop = $('#planDrop', m); const input = $('input', drop);
+  const parse = () => {
+    const res = parsePlanSource(src, ym); rows = res.rows; kindsFound = res.kinds;
+    const exists = new Set(DB.events.map((e) => e.date + '|' + e.title));
+    rows.forEach((r) => { r.dept = r.dept || ME.dept; r.dup = exists.has(r.date + '|' + r.title); r.ok = !r.dup; });
+    if (!d.kind) $('#impKind', m).value = kindsFound.includes('달력형') ? '월중행사' : '주중업무';
+  };
   const handle = async (file) => {
     if (!file) return;
     srcFile = file;
     $('#planPreview', m).innerHTML = '<div class="empty">파일을 읽는 중…</div>';
     try {
-      const { raw, txt } = await readSheetRows(file);
-      rows = mapPlanRows(raw, txt);
-      const exists = new Set(DB.events.map((e) => e.date + '|' + e.title));
-      rows.forEach((r) => { r.dup = exists.has(r.date + '|' + r.title); r.ok = !!r.date && !r.dup; });
+      src = await readMealSource(file);
+      const det = detectYM(src.texts); const T = today();
+      ym = { y: (det && det.y) || T.getFullYear(), m: (det && det.m) || T.getMonth() + 1 };
+      if (det && !det.y) ym.y = yearFor(det.m, { y: T.getFullYear(), m: T.getMonth() + 1 });
+      parse();
       $('#st2', m).className = 'on'; $('#st3', m).className = 'on';
       renderPreview();
-      $('#impGo', m).disabled = false;
     } catch (err) { $('#planPreview', m).innerHTML = `<div class="empty" style="color:var(--red)">${esc(err.message)}</div>`; }
   };
   function renderPreview() {
-    $('#planPreview', m).innerHTML = `<p style="margin:14px 0 8px;font-size:14px"><b>${esc(srcFile.name)}</b> — ${rows.length}건 인식 · 변환 전 내용을 확인·수정하세요.</p>
-      <div class="table-wrap"><table class="tbl"><thead><tr><th></th><th>날짜</th><th>시간</th><th>업무</th><th>장소</th><th>담당부서</th><th>상태</th></tr></thead><tbody>
-      ${rows.map((r, i) => `<tr><td><input type="checkbox" data-i="${i}" ${r.ok ? 'checked' : ''} ${r.date ? '' : 'disabled'}></td>
+    const box = $('#planPreview', m);
+    if (!rows.length) {
+      box.innerHTML = `<div class="empty" style="color:var(--red);text-align:left;padding:16px 4px">일정을 찾지 못했습니다.<br><span style="font-size:13px;color:var(--text-2)">· 목록형: 첫 줄에 「날짜」「업무(내용·행사)」 제목이 있는 표<br>· 날짜별 행: 한 열에 날짜(예: 9.22(월))가 세로로, 옆 칸에 일정<br>· 달력형: 칸의 첫 줄에 날짜, 그 아래에 일정<br>· 문장: 「9. 22.(월) 14:00 교직원 연수(강당)」처럼 날짜로 시작하는 줄</span></div>`;
+      $('#impGo', m).disabled = true; return;
+    }
+    const years = [ym.y - 1, ym.y, ym.y + 1];
+    box.innerHTML = `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:14px 0 8px">
+        ${kindsFound.map((k) => `<span class="tag blue">${k}</span>`).join('')}<b>${esc(srcFile.name)}</b> — ${rows.length}건 인식
+        <span style="margin-left:auto;font-size:13px;color:var(--text-2)">날짜에 연·월이 없을 때 기준</span>
+        <select class="input" id="pvY" style="width:auto;padding:6px 10px">${years.map((y) => `<option ${y === ym.y ? 'selected' : ''}>${y}</option>`).join('')}</select>
+        <select class="input" id="pvM" style="width:auto;padding:6px 10px">${Array.from({ length: 12 }, (_, i) => `<option value="${i + 1}" ${i + 1 === ym.m ? 'selected' : ''}>${i + 1}월</option>`).join('')}</select></div>
+      <div class="table-wrap" style="max-height:46vh;overflow:auto"><table class="tbl"><thead><tr><th></th><th>날짜</th><th>시간</th><th>일정</th><th>장소</th><th>담당부서</th><th>상태</th></tr></thead><tbody>
+      ${rows.map((r, i) => `<tr><td><input type="checkbox" data-i="${i}" ${r.ok ? 'checked' : ''}></td>
         <td><input class="input" style="padding:4px 8px;font-size:13px;width:140px" type="date" data-i="${i}" data-f="date" value="${r.date || ''}"></td>
-        <td class="num">${r.start}${r.end ? '~' + r.end : ''}</td><td>${esc(r.title)}</td><td>${esc(r.place)}</td>
+        <td class="num">${r.start}${r.end ? '~' + r.end : ''}</td>
+        <td><input class="input" style="padding:4px 8px;font-size:13px;min-width:200px" data-i="${i}" data-f="title" value="${esc(r.title)}"></td>
+        <td><input class="input" style="padding:4px 8px;font-size:13px;width:110px" data-i="${i}" data-f="place" value="${esc(r.place)}"></td>
         <td><select class="input" style="padding:4px 8px;font-size:13px" data-i="${i}" data-f="dept">${deptOptions(r.dept)}</select></td>
-        <td>${!r.date ? '<span class="tag red">날짜 오류</span>' : r.dup ? '<span class="tag orange">중복</span>' : '<span class="tag green">정상</span>'}</td></tr>`).join('')}
+        <td>${r.dup ? '<span class="tag orange">이미 있음</span>' : '<span class="tag green">새로</span>'}</td></tr>`).join('')}
       </tbody></table></div>`;
-    $$('#planPreview input[type=checkbox]', m).forEach((c) => c.addEventListener('change', () => { rows[c.dataset.i].ok = c.checked; }));
-    $$('#planPreview [data-f]', m).forEach((c) => c.addEventListener('change', () => {
-      const r = rows[c.dataset.i]; r[c.dataset.f] = c.value;
-      if (c.dataset.f === 'date' && c.value) { r.ok = true; renderPreview(); }
-    }));
+    $$('input[type=checkbox]', box).forEach((c) => c.addEventListener('change', () => { rows[c.dataset.i].ok = c.checked; }));
+    $$('[data-f]', box).forEach((c) => c.addEventListener('change', () => { rows[c.dataset.i][c.dataset.f] = c.value; }));
+    [$('#pvY', box), $('#pvM', box)].forEach((s) => s.addEventListener('change', () => { ym = { y: +$('#pvY', box).value, m: +$('#pvM', box).value }; parse(); renderPreview(); }));
+    $('#impGo', m).disabled = false;
   }
   input.addEventListener('change', () => handle(input.files[0]));
   drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('drag'); });
@@ -475,21 +584,23 @@ ACT.planImport = (d) => {
   drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('drag'); handle(e.dataTransfer.files[0]); });
   $('#impGo', m).addEventListener('click', async () => {
     const kind = $('#impKind', m).value;
-    const sel = rows.filter((r) => r.ok && r.date);
-    if (!sel.length) return toast('변환할 항목을 선택하세요.');
+    const sel = rows.filter((r) => r.ok && r.date && r.title);
+    if (!sel.length) return toast('반영할 일정을 선택하세요.');
+    $('#impGo', m).disabled = true;
     sel.forEach((r) => DB.events.push({
-      id: uid('e'), date: r.date, start: r.start, end: r.end, title: r.title, place: r.place, dept: r.dept, manager: r.manager, kind, important: false,
+      id: uid('e'), date: r.date, start: r.start, end: r.end, title: r.title, place: r.place, dept: r.dept, manager: r.manager || '', kind, important: false,
       owner: ME.id, memo: '', createdAt: nowISO(), updatedAt: nowISO(), updatedBy: ME.id, fromFile: srcFile.name,
     }));
     const dates = sel.map((r) => r.date).sort();
     if ($('#impKeep', m).checked) {
-      const doc = await createDoc(srcFile, { title: srcFile.name.replace(/\.[^.]+$/, ''), category: '업무계획', dept: ME.dept, note: `${kind} ${sel.length}건 일정 변환` }, true);
-      doc.planRange = { from: dates[0], to: dates[dates.length - 1] };
+      try { const doc = await createDoc(srcFile, { title: srcFile.name.replace(/\.[^.]+$/, ''), category: '업무계획', dept: ME.dept, note: `${kind} ${sel.length}건 일정 반영` }, true); doc.planRange = { from: dates[0], to: dates[dates.length - 1] }; }
+      catch (e) { toast('원본 보존 실패: ' + e.message); }
     }
+    const to = kind === '주중업무' ? `#weekly/${dates[0]}` : kind === '월중행사' ? `#monthly/${dates[0]}` : `#calendar/month/${dates[0]}`;
     log('import', 'plan', `${kind} ${sel.length}건`, srcFile.name);
-    notify(`새로운 ${kind === '주중업무' ? '주중업무계획' : '월중행사계획'}이 등록되었습니다. (${sel.length}건)`, 'plan', `#${kind === '주중업무' ? 'weekly' : 'monthly'}/${dates[0]}`);
+    notify(`새로운 ${kind === '주중업무' ? '주중업무계획' : kind === '월중행사' ? '월중행사계획' : '일정'}이 등록되었습니다. (${sel.length}건)`, 'plan', to);
     saveDB(); closeModal(); toast(`${sel.length}건이 일정에 반영되었습니다.`);
-    location.hash = `#${kind === '주중업무' ? 'weekly' : 'monthly'}/${dates[0]}`; rerender();
+    location.hash = to; rerender();
   });
 };
 

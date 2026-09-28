@@ -111,6 +111,7 @@ function splitMealLines(text) {
   return out;
 }
 function detectYM(strs) {
+  for (const s of strs) { const m = /(20\d{2})\s*학년도\s*(\d{1,2})\s*월/.exec(s || ''); if (m && +m[2] >= 1 && +m[2] <= 12) return { y: +m[2] <= 2 ? +m[1] + 1 : +m[1], m: +m[2] }; }
   for (const s of strs) { const m = /(20\d{2})\s*[년.\-/]\s*(\d{1,2})\s*월?/.exec(s || ''); if (m && +m[2] >= 1 && +m[2] <= 12) return { y: +m[1], m: +m[2] }; }
   for (const s of strs) { const m = /(\d{1,2})\s*월/.exec(s || ''); if (m && +m[1] >= 1 && +m[1] <= 12) return { y: null, m: +m[1] }; }
   return null;
@@ -171,7 +172,7 @@ async function readMealSource(file) {
   const ext = extOf(file.name);
   if (ext === 'hwp' || ext === 'hwpx') {
     const d = ext === 'hwp' ? await parseHwpDoc(file) : await parseHwpxDoc(file);
-    return { grids: d.tables.map((g) => ({ grid: g, raw: null })), texts: [file.name, ...d.paras, ...d.tables.flat(2)] };
+    return { grids: d.tables.map((g) => ({ grid: g, raw: null })), paras: d.paras, texts: [file.name, ...d.paras, ...d.tables.flat(2)] };
   }
   await loadLib('XLSX');
   const wb = ext === 'csv' ? XLSX.read(await file.text(), { type: 'string', raw: true }) : XLSX.read(await file.arrayBuffer(), { type: 'array' });
@@ -179,7 +180,7 @@ async function readMealSource(file) {
     grid: XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: false, defval: '' }).map((r) => r.map((x) => String(x).replace(/\r/g, ''))),
     raw: XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: '' }),
   }));
-  return { grids, texts: [file.name, ...grids.flatMap((g) => g.grid.slice(0, 6).flat())] };
+  return { grids, paras: [], texts: [file.name, ...grids.flatMap((g) => g.grid.slice(0, 6).flat())] };
 }
 function parseMealSource(src, ym) {
   for (const g of src.grids) { const r = parseMealList(g.grid, g.raw, ym); if (r) return { kind: '목록형', rows: r }; }
